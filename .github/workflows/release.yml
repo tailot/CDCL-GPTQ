@@ -1,0 +1,106 @@
+name: release
+
+# Triggered by a version tag (v*): build the Linux binary, package it and attach it to the GitHub Release created from
+# that tag. Kept deliberately narrow - one target, no cross-compilation matrix - because this project's reproducibility
+# story is "statically linked, runs anywhere", which crt-static gives us for free on ubuntu-22.04.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Shared by build and test, so the artifact is the same binary the tests validated (and a test that only passes on a
+  # narrower instruction set cannot hide behind different flags).
+  RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+crt-static'
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    env:
+      # Single place the artifact name is built; $STAGE is then reused verbatim by package, notes and upload, so a typo
+      # cannot make the sha256 refer to a file that was never created.
+      STAGE: cdclq-${{ github.ref_name }}-linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than left to the runner default so a release built today and one built in a year produce the same
+      # codegen; rust-toolchain.toml is absent on purpose, CI owns this choice.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.100'
+
+      - uses: Swatinem/rust-cache@v2
+
+      # RUSTFLAGS rather than .cargo/config.toml: the local Windows build must keep its MSVC defaults, and a committed
+      # config would change that for everyone. `-C target-cpu=x86-64-v3` is the AVX2 baseline - this binary quantizes
+      # multi-GB models, so the SIMD GEMM width matters - while staying runnable on any server CPU from 2014 on.
+      # `+crt-static` links glibc in, so the artifact does not depend on the runner's glibc version and needs no
+      # matching runtime on the target machine.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
+      # no model files needed. Then the link check: `ldd` on a static binary prints "not a dynamic executable" and still
+      # exits 0, so the guard looks for an actually resolved dependency (a line containing "=>") and fails the job if it
+      # finds one. That is the case worth failing on - a dynamically linked artifact would upload "successfully" and then
+      # break on the older glibc of the user's distro. A missing or erroring ldd passes, since it proves nothing either way.
+      - name: Smoke the artifact
+        run: |
+          ./target/release/cdclq --version
+          file ./target/release/cdclq
+          if ldd ./target/release/cdclq 2>&1 | grep -q '=>'; then
+            echo "ERROR: binary is dynamically linked, +crt-static did not take effect" >&2
+            exit 1
+          fi
+          echo "statically linked, no dynamic dependencies"
+
+      # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
+      # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
+      # release's; Cargo.toml should be bumped to match the tag, and `cdclq --version` prints that same version.
+      - name: Package
+        run: |
+          mkdir -p "$STAGE" dist
+          cp target/release/cdclq "$STAGE/cdclq"
+          cp README.md Cargo.toml Cargo.lock "$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
+          tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+          ( cd dist && sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256" )
+          ls -l dist
+
+      # Notes are written here rather than left to generate_release_notes: with direct pushes to main there are no PRs to
+      # list, and what a downloader needs is the digest plus the build flags that decide whether the binary runs at all.
+      # Backticks come from a variable so bash cannot read them as command substitution inside the fenced block.
+      - name: Release notes
+        run: |
+          BT='`'
+          {
+            echo "Linux x86-64 binary for CDCL-GPTQ."
+            echo
+            echo "${BT}${BT}${BT}"
+            cat "dist/$STAGE.tar.gz.sha256"
+            echo "${BT}${BT}${BT}"
+            echo
+            echo "- Static binary (${BT}+crt-static${BT}): no glibc or runtime dependency on the target machine."
+            echo "- Built for x86-64-v3 (AVX2): needs a CPU from 2014 or newer."
+            echo "- Toolchain: Rust stable 1.100, ${BT}cargo build --release --locked${BT} with fat LTO."
+          } > dist/NOTES.md
+          cat dist/NOTES.md
+
+      # softprops/action-gh-release creates the release from the tag if it does not exist yet, so pushing a tag is the
+      # only human step needed. fail_on_missing_files makes an empty glob (packaging broke) an error instead of an empty
+      # release with no assets.
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          body_path: dist/NOTES.md
+          fail_on_missing_files: true
