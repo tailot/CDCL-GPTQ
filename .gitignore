@@ -16,3 +16,7 @@ __pycache__/
 # binari compilati a mano: ora li produce il workflow .github/workflows/release.yml su tag v* e li allega
 # alla GitHub Release; un commit da 8,6 MB non è versionabile e diventa obsoleto al primo rebuild
 /dist/
+
+# Output of the release workflow's artifact check: it writes its probe reports next to the checkout so they can be read back
+# with plain `cat` into the job log. Local runs of that step leave the same directory behind.
+/artifact-evidence/
