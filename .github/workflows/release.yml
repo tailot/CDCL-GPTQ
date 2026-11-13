@@ -61,73 +61,65 @@ jobs:
         run: cargo test --release --locked --all-targets
 
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
-      # no model files needed. Then the static-link guard, which must never be able to abort on its own diagnostics.
+      # no model files needed. Then a diagnostic step for the static link.
       #
-      # Seven runs failed here with a bare "exit code 1" and nothing readable, because of a trap worth writing down: Actions
-      # runs each script under `bash -e`, so any command returning non-zero ends the script at that line, and stdout is then
-      # hidden from the log. A `{ ... } | tee` block looks safe because every command inside it carries `|| true`, but a
-      # *function* called in that block does not: `log`, `fail` and `[ -f ] || fail` all returned non-zero on the way to a
-      # verdict (a function's status is its last command, here an append followed by a grep that finds nothing), so the
-      # script died before writing anything. Every call that can legitimately return non-zero now ends in `|| true`, the
-      # file test is an if-block rather than a `||` chain, and the verdict comes from `exit 0`/`exit 1` at the very end.
-      # Evidence goes to $GITHUB_STEP_SUMMARY, which renders in full on the run page even when the step fails.
+      # Nine runs failed at this step showing only "Process completed with exit code 1", because every version of the guard
+      # was written against an assumption about how the runner reports ELF linkage, and each assumption proved wrong: ldd's
+      # exit status (it exits non-zero on binaries it declines to inspect), requiring no INTERP header and no DT_NEEDED entry
+      # (a +crt-static binary on a gnu target has both, so that check rejected every good build), and the shell's own status
+      # under Actions' `bash -e`.
       #
-      # What the guard asserts, after two wrong theories cost those runs: `+crt-static` on x86_64-unknown-linux-gnu links
-      # glibc into the executable but *keeps* an ELF interpreter and a DT_NEEDED entry for libc.so.6 - a static binary with
-      # an interpreter is normal on a gnu target, so requiring neither rejected every good build. And ldd's exit status means
-      # nothing here: it exits 1 on binaries it declines to inspect. The property that actually protects users on older
-      # distros is that no library resolves to a shared object at exec time, which is exactly what an "name => path" arrow
-      # reports. So the verdict reads text only: arrow present means fail, anything else (fully static output, or ldd
-      # declining) means pass, and empty output fails because silence is not evidence.
-      - name: Smoke the artifact
+      # That last one deserves its exact rule, since it is what actually killed each attempt: in an assignment of the form
+      # x=$(cmd), the command substitution alone can abort the script, even though the line looks harmless. A trailing
+      # `|| true` keeps the statement alive but records the guard's status (always 0) instead of the tool's, so it is
+      # useless for diagnostics - and without it, a probe that exits non-zero ends the step before any evidence is printed.
+      # Every probe here is therefore a plain command with its output redirected into a file: redirection does not change the
+      # exit status, nothing is captured in a variable, and each tool's real answer is read back from its own report file.
+      # There are no pipelines anywhere in this step, because Actions takes the last command's status as the step's status.
+      #
+      # Evidence goes to stdout and to $GITHUB_STEP_SUMMARY, which renders in full on the run page even when the step fails.
+      # Only three things can fail: no artifact, an artifact that cannot run, or a tool reporting that a library resolved to
+      # a path on disk ("name => path") - the last is what breaks on an older distro. Whatever this runner's ldd, readelf and
+      # file actually say lands in the log verbatim, so any further change responds to observed behaviour rather than to
+      # another guess.
+      - name: Inspect the artifact
         run: |
           BIN=./target/release/cdclq
-          log() { printf '%s\n' "$1" || true; }
-          note() { printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY" || true; }
-          both() { log "$1"; note "$1"; }
-          fence() { note '```'; }
-          RC=0
-          { echo "### Artifact evidence"; fence; } >> "$GITHUB_STEP_SUMMARY"
+          D="$RUNNER_TEMP/artifact-check"
+          mkdir -p "$D" || true
+          say() { echo "$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # `|| true` is fine here precisely because the status that matters lives inside the report file, not in this
+          # command's exit code: a missing tool becomes text in its own report instead of an invisible abort.
+          "$BIN" --version > "$D/version.txt" 2>&1 || true
+          ldd "$BIN" > "$D/ldd.txt" 2>&1 || true
+          readelf -h "$BIN" > "$D/elf-header.txt" 2>&1 || true
+          readelf -l "$BIN" > "$D/prog-headers.txt" 2>&1 || true
+          readelf -d "$BIN" > "$D/dynamic.txt" 2>&1 || true
+          file "$BIN" > "$D/file-type.txt" 2>&1 || true
+
+          say "### Artifact evidence"
+          for f in version ldd elf-header prog-headers dynamic file-type; do
+            say "$f: $(cat "$D/$f.txt")"
+          done
 
           if [ ! -f "$BIN" ]; then
-            both "ERROR: $BIN was not produced by the build"
-            fence
-            log "step verdict: fail (missing artifact)"
+            say "step verdict: FAIL - $BIN was not produced by the build"
             exit 1
           fi
-
-          ld=$(ldd "$BIN" 2>&1 || true)
-          { "$BIN" --version
-            echo "--- file ---"; file "$BIN" 2>&1 || true
-            echo "--- ELF header ---"; readelf -h "$BIN" 2>&1 | grep -E 'Machine|Type|Entry' || true
-            echo "--- DT_NEEDED entries (an interpreter is expected on a gnu target; +crt-static resolves these inside the binary) ---"
-            readelf -d "$BIN" 2>&1 | grep NEEDED || echo "none"
-            echo "--- ldd ---"; printf '%s\n' "$ld"; } | tee -a "$GITHUB_STEP_SUMMARY" || true
-
-          # `grep -q` returns 1 when it finds nothing, so the test lives inside the if-condition, where `set -e` does not
-          # apply; a bare `grep ... || true` line before it would have aborted the script on the passing path.
-          if printf '%s\n' "$ld" | grep -q '=>'; then
-            both "ERROR: a shared dependency resolved, +crt-static did not take effect"
-            RC=1
-          elif [ -z "$ld" ]; then
-            # The probe itself is unavailable on this runner. An unverifiable artifact should not ship silently.
-            both "ERROR: ldd produced no output, so the static link cannot be verified"
-            RC=1
-          elif printf '%s\n' "$ld" | grep -qiE 'not a dynamic executable|statically linked'; then
-            [ "$RC" = 0 ] && note "verdict: no dynamic section to resolve - fully static" || true
-          else
-            # No arrow, no complaint we recognise: for a gnu crt-static binary ldd declines to inspect the file, which is
-            # the expected answer. Nothing was resolved from disk, so the promise holds; the exact wording is in the log.
-            [ "$RC" = 0 ] && note "verdict: ldd resolved nothing from disk (wording above)" || true
+          # --version failing means the artifact cannot run at all, which outranks any linkage question.
+          if grep -qiE 'no such file|command not found' "$D/version.txt"; then
+            say "step verdict: FAIL - the binary did not run: $(cat "$D/version.txt")"
+            exit 1
           fi
-
-          fence
-          if [ "$RC" = 0 ]; then
-            log "step verdict: pass (see the evidence above)"
-            exit 0
+          # The one linkage assertion, phrased so it does not depend on how a given ldd describes a static binary: fail only
+          # when something was actually resolved to a path on disk.
+          if grep -q '=>' "$D/ldd.txt"; then
+            say "step verdict: FAIL - ldd resolved a shared dependency to a path, +crt-static did not take effect"
+            exit 1
           fi
-          log "step verdict: fail (see the evidence above)"
-          exit 1
+          say "step verdict: PASS - the binary runs and no shared dependency resolved to a path"
+          exit 0
 
       # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
       # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
