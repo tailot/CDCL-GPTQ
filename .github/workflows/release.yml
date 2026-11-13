@@ -13,16 +13,14 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Shared by build and test, so the artifact is the same binary the tests validated (and a test that only passes on a
-  # narrower instruction set cannot hide behind different flags).
-  RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+crt-static'
 
 jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
     env:
       # Single place the artifact name is built; $STAGE is then reused verbatim by package, notes and upload, so a typo
-      # cannot make the sha256 refer to a file that was never created.
+      # cannot make the sha256 refer to a file that was never created. Codegen flags live in the Build step, not here: see
+      # the comment there for why RUSTFLAGS breaks proc-macro dependencies.
       STAGE: cdclq-${{ github.ref_name }}-linux-x86_64
     steps:
       - uses: actions/checkout@v4
@@ -35,16 +33,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # RUSTFLAGS rather than .cargo/config.toml: the local Windows build must keep its MSVC defaults, and a committed
-      # config would change that for everyone. `-C target-cpu=x86-64-v3` is the AVX2 baseline - this binary quantizes
-      # multi-GB models, so the SIMD GEMM width matters - while staying runnable on any server CPU from 2014 on.
-      # `+crt-static` links glibc in, so the artifact does not depend on the runner's glibc version and needs no
-      # matching runtime on the target machine.
+      # `-C target-cpu=x86-64-v3` is the AVX2 baseline - this binary quantizes multi-GB models, so the SIMD GEMM width
+      # matters - while staying runnable on any server CPU from 2014 on. `+crt-static` links glibc in, so the artifact does
+      # not depend on the runner's glibc version and needs no matching runtime on the target machine.
+      #
+      # Both go through `cargo rustc -- --codegen`, never RUSTFLAGS, for two reasons that each cost a broken release once.
+      # (1) RUSTFLAGS applies to every crate cargo compiles, and clap's derive macro is a proc-macro: a compiler plugin that
+      # runs on the *build* machine, not in the shipped binary. `+crt-static` reaches into it and leaves it with a crate
+      # type the host cannot load — "cannot produce proc-macro for clap_derive ... the target does not support these crate
+      # types", exit 101, before any of our code is compiled. (2) RUSTFLAGS is also restricted to the top-level package, so
+      # even without problem (1) it would skip the library where the GEMM kernels live and ship a binary whose hot loops
+      # have no AVX2. Flags after `--` go to rustc for one named target only, and do not invalidate cargo's dependency cache.
+      #
+      # That means two explicit invocations: cargo refuses extra rustc arguments when more than one target is selected, so
+      # the lib and the bin are compiled separately with the same codegen pair. `--all-targets` is therefore not used here;
+      # lib + bin is the whole artifact (tests are validated in the next step and never shipped).
       - name: Build
-        run: cargo build --release --locked
+        run: |
+          CG="--codegen target-cpu=x86-64-v3 --codegen target-feature=+crt-static"
+          cargo rustc --release --locked --lib -- $CG
+          cargo rustc --release --locked --bin cdclq -- $CG
 
+      # Plain `cargo test`: the suite validates behaviour, and codegen flags must not be what makes a test pass or fail.
+      # `--all-targets` compiles the integration-test binary as well, which plain `cargo test` builds anyway but is explicit
+      # about here so a regression in tests/toy_models.rs cannot ship unnoticed.
       - name: Test
-        run: cargo test --release --locked
+        run: cargo test --release --locked --all-targets
 
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
       # no model files needed. Then the link check: `ldd` on a static binary prints "not a dynamic executable" and still
