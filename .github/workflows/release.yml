@@ -63,50 +63,58 @@ jobs:
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
       # no model files needed. Then a diagnostic step for the static link.
       #
-      # Ten runs failed at this step showing only "Process completed with exit code 1", because every version of the guard
+      # Eleven runs failed at this step showing only "Process completed with exit code 1", because every version of the guard
       # was written against an assumption about how the runner reports ELF linkage, and each assumption proved wrong: ldd's
       # exit status (it exits non-zero on binaries it declines to inspect), requiring no INTERP header and no DT_NEEDED entry
       # (a +crt-static binary on a gnu target has both, so that check rejected every good build), and the shell's own status
       # under Actions' `bash -e`.
       #
-      # That last one is what actually killed each attempt, and its rule is worth spelling out: this script runs with `-e`, so
-      # the first command returning non-zero ends it at that line. Three shapes hide that trap. A shell *function* returns its
-      # last command's status, so a logging helper whose final command is an append can abort the caller. `local x=$(cmd)` and
-      # `export x=$(cmd)` hide the substitution's status entirely, because `local`/`export` is the command bash reports. And a
-      # bare `x=$(cmd)` aborts on the substitution's own non-zero status - which is exactly how the tenth run died without
-      # printing a single line of evidence, even though the identical line survives locally under `set -e`.
+      # That third one is what actually killed each attempt, and it deserves its exact rule: Actions runs each script with
+      # `bash -e`, but `-e` does not abort on every failing command. It skips functions, it skips anything in a condition or
+      # followed by `||`, and an assignment takes the status of its last command substitution rather than behaving like a bare
+      # command. Every version of this step guessed at which shapes would trip it and got one wrong, and because stdout is
+      # discarded once the script dies, each wrong guess produced a run with no output at all - so nothing about the runner was
+      # ever learned, only that something had failed.
       #
-      # So: probes are plain commands with redirection only (redirection never changes an exit status), each writing its
-      # output and its `$?` to files under RUNNER_TEMP; every call is followed by `|| true`, which is harmless here because the
-      # verdict comes from the status file rather than from that line; and no assignment inside this step depends on a
-      # substitution that can fail - the ones in the reporting loop read files this very step wrote, and carry their own
-      # fallback. There are no pipelines anywhere, since Actions takes the last command's status as the step's status.
+      # This version stops relying on that rule. Inside the step, no construct is allowed to be the thing that fails: probes
+      # are plain commands whose stdout, stderr and `$?` go to files under RUNNER_TEMP through redirection (which never
+      # changes an exit status); the helpers end with an assignment instead of a redirect, since a function returns its last
+      # command's status; and the evidence is appended straight from those files, one guarded `cat` per line, with no command
+      # substitution and no pipeline anywhere in the reporting path. Whatever this runner's ldd, readelf and file print then
+      # reaches both the log and $GITHUB_STEP_SUMMARY - which renders on the run page even when the step fails - so the next
+      # change can respond to observed behaviour instead of to another guess about the image.
       #
-      # Evidence goes to stdout and to $GITHUB_STEP_SUMMARY, which renders in full on the run page even when the step fails.
-      # Only three things can fail it: no artifact, an artifact that cannot run, or a tool reporting that a library resolved
-      # to a path on disk ("name => path") - the last is what breaks on an older distro. Whatever this runner's ldd, readelf
-      # and file actually say lands in the log verbatim, so any further change responds to observed behaviour instead of to
-      # another guess.
+      # What can still fail is only what is worth failing on: no artifact, an artifact that does not exit 0 on --version, or a
+      # tool reporting that a library resolved to a path on disk ("name => path"), which is the condition that actually breaks
+      # on an older distro.
       - name: Inspect the artifact
         run: |
           BIN=./target/release/cdclq
-          # RUNNER_TEMP is a given on Actions runners, but if it ever were empty the path would collapse to
-          # /artifact-check and the probes would silently write nothing at all.
+          # RUNNER_TEMP is a given on Actions runners, but if it ever were empty the path would collapse to /artifact-check
+          # and the probes would write nothing at all; `:?` makes that loud. It also turns out that bash -e does *not* abort on
+          # every failing simple command - only on some shapes, an unbound-parameter expansion among them - which is why the
+          # same script behaved differently in two places and taught me nothing reliable about the runner. So this step now
+          # avoids relying on that rule entirely: no construct inside it is allowed to be the thing that fails.
           D="${RUNNER_TEMP:?RUNNER_TEMP must be set}/artifact-check"
           rm -rf "$D" || true
           mkdir -p "$D" || true
 
-          # `say` writes one line to stdout and the same line to the job summary. It ends with an assignment, not a command:
-          # a function's exit status is its last command's, and Actions runs this script under `bash -e`, so a helper whose
-          # final command returns non-zero silently ends the whole step - that is what made eight earlier failures unreadable.
+          # `say` writes one line to stdout and the same line to the job summary, ending with an assignment: a function's exit
+          # status is its last command's, so a helper ending in a redirect could abort the caller.
           say() { echo "$1"; printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; report="$?"; }
 
-          # One probe per line, output and exit status written to files by a plain command with redirection. Redirection does
-          # not change the exit status, and nothing is read back through `$(...)`: on Actions' runner a failing command
-          # substitution aborts the script even when the surrounding line looks harmless (`local x=$(cmd)` is worse still,
-          # because `local` hides the status entirely). `|| true` guards each probe because the verdict comes from the status
-          # file, not from this line - and a missing tool then becomes text in its own report instead of an invisible abort.
-          probe() { name="$1"; shift; "$@" > "$D/$name.txt" 2> "$D/$name.err"; printf '%s\n' "$?" > "$D/$name.status"; }
+          # Each probe writes three files - stdout, stderr and its exit status - through redirection only. Redirection never
+          # changes an exit status, so a missing tool becomes text in its own report instead of ending the script, and no
+          # result has to travel back through a command substitution.
+          #
+          # Two traps here, both hit by earlier attempts and both reproduced on bash 5.2:
+          # (a) under Actions' `bash -e` a failing command inside a *function* aborts the whole script, so the call itself
+          #     needs a guard - that is what ended three consecutive runs at their very first probe with nothing printed;
+          # (b) `$?` read after any intervening command reports *that* command's status, not the tool's. Guarding the tool
+          #     with `|| true` inside the function made every recorded status 0 and turned a genuinely broken binary into a
+          #     PASS. The status therefore has to be captured as the very first thing after the call, which is why the guard
+          #     sits on the call site and `$?` is saved before anything else runs.
+          probe() { name="$1"; shift; rc=0; "$@" > "$D/$name.txt" 2> "$D/$name.err" || rc=$?; printf '%s\n' "$rc" > "$D/$name.status"; report="$?"; }
           probe version "$BIN" --version || true
           probe ldd ldd "$BIN" || true
           probe elf-header readelf -h "$BIN" || true
@@ -114,28 +122,45 @@ jobs:
           probe dynamic readelf -d "$BIN" || true
           probe file-type file "$BIN" || true
 
-          # The evidence block. Each line is one `say` call with the status file read through a command substitution that can
-          # only ever succeed (the file was just written) and with `cat`'s own failure folded into the value, so no line here
-          # can end the step before the rest of the evidence has been printed.
+          # The evidence block, with no command substitution and no pipeline anywhere in it: the status is appended straight
+          # from its file and so is the tool's own answer, each guarded by `|| true`. Whatever this runner's ldd, readelf and
+          # file actually print therefore reaches both the log and the job summary, even if a later check disagrees. Each cat
+          # carries an explicit path rather than the loop variable: that way the printed line names the file it opened, so a
+          # wrong loop list shows up as a missing section instead of six copies of one probe.
           say "### Artifact evidence"
-          for f in version ldd elf-header prog-headers dynamic file-type; do
-            if [ ! -f "$D/$f.status" ]; then
-              say "$f: PROBE DID NOT COMPLETE (no $f.status written)"
-              continue
-            fi
-            st=$(cat "$D/$f.status" || echo unreadable)
-            out=$(cat "$D/$f.txt" 2>/dev/null; cat "$D/$f.err" 2>/dev/null)
-            say "$f (exit $st): $out"
-          done
+          say "--- version, exit status on the next line ---"
+          cat "$D/version.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/version.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/version.err" >> "$GITHUB_STEP_SUMMARY" || true
+          say "--- ldd, exit status on the next line ---"
+          cat "$D/ldd.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/ldd.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/ldd.err" >> "$GITHUB_STEP_SUMMARY" || true
+          say "--- readelf -h, exit status on the next line ---"
+          cat "$D/elf-header.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/elf-header.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/elf-header.err" >> "$GITHUB_STEP_SUMMARY" || true
+          say "--- readelf -l, exit status on the next line ---"
+          cat "$D/prog-headers.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/prog-headers.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/prog-headers.err" >> "$GITHUB_STEP_SUMMARY" || true
+          say "--- readelf -d, exit status on the next line ---"
+          cat "$D/dynamic.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/dynamic.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/dynamic.err" >> "$GITHUB_STEP_SUMMARY" || true
+          say "--- file, exit status on the next line ---"
+          cat "$D/file-type.status" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/file-type.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$D/file-type.err" >> "$GITHUB_STEP_SUMMARY" || true
 
           if [ ! -f "$BIN" ]; then
             say "step verdict: FAIL - $BIN was not produced by the build"
             exit 1
           fi
-          # --version failing means the artifact cannot run at all, which outranks any linkage question.
-          ver=$(cat "$D/version.status" || echo missing)
-          if [ "$ver" != 0 ]; then
-            say "step verdict: FAIL - \`--version\` exited $ver, so the artifact cannot run regardless of linkage"
+          # --version failing means the artifact cannot run at all, which outranks any linkage question. The status is tested
+          # with grep on a file this step wrote, so no substitution is involved and nothing is lost if the check trips.
+          if ! grep -qx 0 "$D/version.status"; then
+            say "step verdict: FAIL - \`--version\` did not exit 0, so the artifact cannot run regardless of linkage"
             exit 1
           fi
           # The one linkage assertion, phrased so it does not depend on how a given ldd describes a static binary: fail only
