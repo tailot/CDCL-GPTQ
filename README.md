@@ -234,11 +234,54 @@ Reproduction: `cdclq bench --rows 512 --cols 2048 --tokens 16384 --test-tokens 4
 - 9 unit tests: blocked Cholesky, `UᵀU·H = I`, parallel GEMM == serial GEMM, mixed bit-width
   pack/unpack, exactness of the loss decomposition, monotonicity + exact bookkeeping of the repair,
   skeleton/act-order permutation, asymmetric case `M = H ⇒ W* = W`.
+- 7 end-to-end tests over three real tiny-random checkpoints — see [Test suite](#test-suite).
 - Cross-check against an independent float64 numpy GPTQ: **identical codes (100%)**, relative loss
   difference 0.
 - End-to-end CLI test on a toy model (q/k/v aliases, 1-D tensors and embeddings passed through):
   names/dtypes/shapes preserved, `packed → dequant` **bit-exact** versus the direct output, reported
   loss equal to an independent numpy computation (relative difference 3e-5).
+
+## Test suite
+
+```
+cargo test --release          # 9 unit tests + 7 end-to-end tests over real checkpoints
+```
+
+The end-to-end file (`tests/toy_models.rs`) runs the whole pipeline against three ordinary
+`LlamaForCausalLM` checkpoints from the tiny-random family — `llamafactory/tiny-random-Llama-3`
+(hidden 16, **F16**), `tiny-random/llama-3` (hidden 8, GQA 16/8, **BF16**, so `q_proj` is 512×8 and
+`o_proj` 8×512) and `Intel/tiny-random-llama2` (hidden 256, intermediate **172**, GQA 4/2, **F32**).
+They are 4–68 MB instead of gigabytes, so the full suite takes a few seconds on a CI runner while still
+exercising what the unit tests cannot: shard walking, name matching, the q/k/v and gate/up alias graph,
+pass-through of uncalibrated tensors, three storage dtypes, ragged last groups (172 is not a multiple of
+any group size) and the packed-file round-trip on real safetensors files.
+
+The Hessians are **synthetic** (`scripts/gen_toy_hessians.py`: low-rank `AᵀA` plus a ridge, log-normal
+channel scaling) and the weights are randomly initialized, so these tests say nothing about accuracy —
+quality numbers live in `runs/`, measured on TinyLlama-1.1B with real WikiText-2 Hessians. What they do
+pin down is the machinery:
+
+* per-layer proxy loss re-evaluated from the packed file (`tr(E H Eᵀ)` rebuilt from `.qweight`,
+  `.scales`, `.qzeros` and `.perm`) agrees with the reported loss to 5e-3 relative;
+* a CDCL run with `--refine-frac 0` is **bit-identical** to a GPTQ run (same permutation, same grid, same
+  codes, same loss) — this is what makes every gain percentage in the tables above a like-for-like
+  comparison instead of a difference between two algorithms; enabling the repair then lowers the loss on
+  13/14, 14/14 and 14/14 layers without ever moving phase 1;
+* act-order + skeleton: the permutation is a bijection, it reproduces the documented selection rule
+  (descending `H_jj·‖W_:j‖²`, whole groups first, ties by index), promoted groups carry
+  `skeleton_bits` in `.gbits`, and mixed-width rows still decode to legal codes;
+* `--only`/`--skip` select exactly the layers a fixture calibrates (aliases included); an unmatched or
+  shape-mismatched Hessian is a hard error, not a silent skip;
+* dtypes are preserved, F32 widening is lossless, and `bits_total` in the report matches what the packed
+  file actually costs (`bits + 24·ngroups/d_in`, not the nominal `24/group`).
+
+Checkpoints live under `models/` (git-ignored) and the Hessians under `tests/fixtures/` (committed, ~3.4 MB
+total). After a fresh clone the end-to-end tests **skip with a message** rather than fail; to fetch the
+checkpoints and regenerate the fixtures:
+
+```
+python scripts/make_fixtures.py     # downloads the three checkpoints and rewrites tests/fixtures/
+```
 
 ## Known limitations (please read)
 
@@ -270,7 +313,8 @@ src/engine.rs    GPTQ + conflicts + repair + asymmetric target (+ tests)
 src/pipeline.rs  shards, aliases, report, packed → dequant
 src/io.rs        safetensors (F32/F16/BF16), Hessian store
 src/bench.rs     synthetic benchmark
+tests/           toy_models.rs (end-to-end) + fixtures/<model>/hess.safetensors (synthetic Hessians)
 scripts/         capture_hessians.py, ref_gptq_check.py, eval_ppl.py, gen_compare.py, summarize.py,
-                 run_matrix.ps1
+                 gen_toy_hessians.py, make_fixtures.py, run_matrix.ps1
 runs/            RESULTS-tinyllama.md = protocol, full table, generated text, reproduction commands
 ```

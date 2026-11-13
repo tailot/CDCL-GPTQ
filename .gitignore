@@ -8,6 +8,8 @@ __pycache__/
 /runs/*
 !/runs/*.md
 *.safetensors
+# fixture della suite toy: Hessiani sintetici da ~3 KB a ~2 MB, committati per far girare i test senza download
+!tests/fixtures/**/*.safetensors
 *.bin
 *.log
 
