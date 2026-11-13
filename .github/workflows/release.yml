@@ -61,43 +61,54 @@ jobs:
         run: cargo test --release --locked --all-targets
 
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
-      # no model files needed. Every diagnostic below is wrapped in `|| true` on purpose. Actions runs each script under
-      # `bash -e`, so a failing probe aborts the step *before* its output reaches the log — which is exactly what happened
-      # twice here: the step died with a bare exit 1 and nothing to read, because the first diagnostic itself failed. A
-      # smoke step whose job is to explain must not be able to die of an unrelated tool being unavailable or of an expected
-      # non-zero status (ldd exits non-zero on a static binary). Only the verdict at the end decides pass/fail.
+      # no model files needed. This step failed four times with nothing in the log but "Process completed with exit code 1",
+      # because Actions truncates an annotation to the first line of stderr and hides stdout when the script exits non-zero.
+      # So the evidence goes where it cannot be hidden: $GITHUB_STEP_SUMMARY renders as a job summary on the run page, in
+      # full, whether or not the step failed.
       - name: Smoke the artifact
         run: |
           BIN=./target/release/cdclq
-          test -f "$BIN" || { echo "ERROR: $BIN was not produced by the build" >&2; exit 1; }
-          "$BIN" --version
+          log() { printf '%s\n' "$1"; printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          { echo "### Artifact evidence"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-          file "$BIN" || true
-          readelf -h "$BIN" 2>&1 | grep -E 'Machine|Type|Entry' || true
-          echo "--- dynamic section ---"
-          readelf -d "$BIN" 2>&1 | head -n 20 || true
-          echo "--- ldd ---"
+          if [ ! -f "$BIN" ]; then
+            log "ERROR: $BIN was not produced by the build"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # `|| true` on every probe, and no pipeline whose status we inherit: Actions runs this under `bash -e`, so a
+          # diagnostic that returns non-zero (file or readelf missing from the image, or ldd exiting non-zero on a binary
+          # that is correctly static) would abort the step before its verdict was reached. The block's output goes through
+          # tee, so it lands in both the raw log and the summary; each command inside is already guarded.
+          { "$BIN" --version
+            echo "--- file ---"; file "$BIN" 2>&1 || true
+            echo "--- ELF header ---"; readelf -h "$BIN" 2>&1 | grep -E 'Machine|Type|Entry' || true
+            echo "--- program headers ---"; readelf -l "$BIN" 2>&1 | head -n 30 || true
+            echo "--- dynamic section ---"; readelf -d "$BIN" 2>&1 | head -n 20 || true
+            echo "--- ldd ---"; ldd "$BIN" 2>&1 || true; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # The verdict, from text rather than exit codes. Two failure modes the guard keeps apart: a *dynamic* artifact
+          # that uploads "successfully" and then breaks on the older glibc of a user's distro - the real regression this
+          # step exists for - and an unverifiable one, where a probe is missing and silence would look like success.
           ld=$(ldd "$BIN" 2>&1 || true)
-          echo "ldd says: $ld"
-
-          # The verdict, from text rather than exit codes. Two failure modes the guard has to keep apart: a *dynamic*
-          # artifact that uploads "successfully" and then breaks on the older glibc of a user's distro - the real regression
-          # this step exists for - and an unverifiable one, where a probe is missing and silence would look like success.
           if printf '%s\n' "$ld" | grep -q '=>'; then
-            echo "ERROR: binary is dynamically linked, +crt-static did not take effect" >&2
+            log "ERROR: binary is dynamically linked, +crt-static did not take effect"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           # No arrow entry: either genuinely static, or ldd could not say. readelf answers that independently - an ELF with
-          # no INTERP program header has no interpreter and therefore needs no runtime at all. `|| true` on the pipeline
-          # because grep exits 1 when it finds nothing, which here is the passing answer.
+          # no INTERP program header has no interpreter and therefore needs no runtime at all. grep exits 1 when it finds
+          # nothing, which here is the passing answer, hence `|| true`.
           interp=$(readelf -l "$BIN" 2>/dev/null | grep -c 'INTERP' || true)
           needed=$(readelf -d "$BIN" 2>/dev/null | grep -c 'NEEDED' || true)
-          echo "INTERP segments: $interp ; NEEDED entries: $needed"
+          log "INTERP segments: ${interp:-0} ; NEEDED entries: ${needed:-0}"
           if [ "${interp:-0}" != "0" ] || [ "${needed:-0}" != "0" ]; then
-            echo "ERROR: the ELF lists an interpreter or shared dependencies, +crt-static did not take effect" >&2
+            log "ERROR: the ELF lists an interpreter or shared dependencies, +crt-static did not take effect"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "statically linked: no INTERP segment, no NEEDED entries"
+          { echo "statically linked: no INTERP segment, no NEEDED entries"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
       # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
