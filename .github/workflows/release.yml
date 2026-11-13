@@ -61,19 +61,41 @@ jobs:
         run: cargo test --release --locked --all-targets
 
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
-      # no model files needed. Then the link check: `ldd` on a static binary prints "not a dynamic executable" and still
-      # exits 0, so the guard looks for an actually resolved dependency (a line containing "=>") and fails the job if it
-      # finds one. That is the case worth failing on - a dynamically linked artifact would upload "successfully" and then
-      # break on the older glibc of the user's distro. A missing or erroring ldd passes, since it proves nothing either way.
+      # no model files needed.
+      #
+      # Then the static-link guard. Two ways this step went wrong before, so both failure modes are pinned down here rather
+      # than trusted to one clever one-liner: (a) `ldd` on a *statically linked* binary prints "not a dynamic executable"
+      # and still exits 0, while on a missing file it exits non-zero — piping its output through grep hides the real cause
+      # behind whatever grep decided, which is what failed this run; (b) the guard must still catch the case that matters, a
+      # dynamically linked artifact that would upload "successfully" and then break on the older glibc of a user's distro.
+      # So: capture ldd's output once, print it verbatim for the log, and decide from its text with `case`, not from exit
+      # codes or pipelines. A binary cargo did not produce is an error in its own right.
       - name: Smoke the artifact
         run: |
-          ./target/release/cdclq --version
-          file ./target/release/cdclq
-          if ldd ./target/release/cdclq 2>&1 | grep -q '=>'; then
-            echo "ERROR: binary is dynamically linked, +crt-static did not take effect" >&2
-            exit 1
-          fi
-          echo "statically linked, no dynamic dependencies"
+          BIN=./target/release/cdclq
+          test -f "$BIN" || { echo "ERROR: $BIN was not produced by the build" >&2; exit 1; }
+          "$BIN" --version
+          file "$BIN"
+          # `|| true`: ldd exits non-zero on a static binary, and this step must read its text, not inherit its status.
+          ld=$(ldd "$BIN" 2>&1 || true)
+          echo "ldd says: $ld"
+          case "$ld" in
+            *"not a dynamic executable"*|*"statically linked"*)
+              echo "statically linked, no dynamic dependencies" ;;
+            *"=>"*)
+              echo "ERROR: binary is dynamically linked, +crt-static did not take effect" >&2
+              exit 1 ;;
+            *)
+              # An unexpected ldd message is not proof of a dynamic binary, but it is proof we cannot verify the promise,
+              # and an unverifiable artifact should not ship silently. readelf -d is the second opinion: no dynamic section
+              # means no interpreter, whatever ldd chose to print.
+              echo "ldd gave an unexpected answer; checking the ELF dynamic section instead"
+              if readelf -d "$BIN" 2>/dev/null | grep -qE '\(INTERP\)|NEEDED'; then
+                echo "ERROR: the ELF dynamic section lists dependencies, +crt-static did not take effect" >&2
+                exit 1
+              fi
+              echo "no INTERP/NEEDED entries in the dynamic section: statically linked" ;;
+          esac
 
       # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
       # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
