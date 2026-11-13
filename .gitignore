@@ -1,0 +1,12 @@
+/target
+.venv/
+__pycache__/
+
+# artefatti delle misure (enormi): model+hub ~4,6 GB, hess ~3,9 GB, ~2,5 GB per run
+/models/
+/data/
+/runs/*
+!/runs/*.md
+*.safetensors
+*.bin
+*.log

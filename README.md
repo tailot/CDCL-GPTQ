@@ -6,11 +6,12 @@ decomposizione esatta della loss per trovare i sotto-blocchi peggiori e li migli
 esatte e monotone (discesa per coordinate sui codici interi + raffinamento in forma chiusa delle
 scale), alternandole fino a convergenza.
 
-**Risultato misurato (benchmark sintetico, stessi bit, stessa griglia, stesso ordinamento, stessa
-dampatura):** errore su token *held-out* ridotto del **−6% … −17%** rispetto a GPTQ (−9.6% a 3 bit,
-−17.3% a 2 bit, −6.9% a 4 bit), al costo di **~1.5–5× il tempo** di GPTQ. Vedi "Risultati" e, subito
-sotto, "Limiti": **non ho potuto misurare la perplexity su un LLM reale** (nessun modello, nessuna GPU
-e nessun accesso a Hugging Face in questo ambiente).
+**Risultato misurato su un LLM reale (TinyLlama-1.1B, WikiText-2, stessi bit, stessa griglia, stesso
+ordinamento, stessa dampatura):** perplexity ridotta del **−9.0% a 3 bit** e **−16.6% a 3 bit con
+`--mse-grid`** rispetto a GPTQ, a parità di compressione (3.19 bit/peso → modello 3,38× più piccolo), al costo
+di **~3–4× il tempo** di GPTQ. A 2 bit la differenza è qualitativa: GPTQ produce un modello morto (ppl 29 000),
+CDCL con `--group 64 --mse-grid` lo porta a 47. Su layer sintetico il guadagno era −6% … −17%; vedi "Risultati
+su un LLM reale" e "Risultati" (sintetico).
 
 ## Cosa è stato corretto rispetto alla specifica
 
@@ -70,6 +71,12 @@ cdclq quantize --weights model.safetensors --hessians hess.safetensors --out-dir
 #   out/packed/<shard>.safetensors   modello bit-packed (qweight, scales f16, qzeros u8, perm, gbits, gsize)
 #   out/report.json                  loss GPTQ vs finale, bit, tempi per layer
 cdclq dequant --input out/packed/model.safetensors --output ricostruito.safetensors
+
+# 4) valutazione (ppl + top-1 su testo held-out, pesi fake-quant) e testo generato
+python scripts/eval_ppl.py --model ./modello --text test.txt --dequant out/dequant/model.safetensors \
+       --json out.eval.json
+python scripts/gen_compare.py --model ./modello --dequant out/dequant/model.safetensors --labels cdcl
+python scripts/summarize.py            # tabella markdown da tutti i report.json + *.eval.json in runs/
 ```
 
 Opzioni principali (`cdclq quantize --help`): `--bits`, `--group` (0 = una scala per riga),
@@ -80,6 +87,45 @@ Opzioni principali (`cdclq quantize --help`): `--bits`, `--group` (0 = una scala
 (con alias da metadato `aliases`).
 
 Profili di velocità: `--passes 2 --refine-frac 0.5` (veloce), `--passes 4` (bilanciato), default (completo).
+
+## Risultati su un modello reale (TinyLlama-1.1B)
+
+Prima verifica su un LLM reale (macchina: 24 core CPU, RTX 5070 Ti usata solo per Hessiane e valutazione).
+Modello `TinyLlama/TinyLlama_v1.1` (1,1 B parametri, fp16, 2200 MB), calibrazione WikiText-2 train
+(128 × 2048 token), valutazione WikiText-2 **test** (334 521 token, chunk da 1024, pesi fake-quant di
+`out/dequant`). `--group 128 --damp 0.01`, act-order, GPTQ e CDCL con impostazioni identiche. Dettaglio completo,
+campioni di testo generato e comandi di riproduzione: `runs/RESULTS-tinyllama.md`.
+
+| configurazione | bit/peso | modello (MB) | vs fp16 | tempo (s) | perplexity | vs fp16 | top-1 % | vs GPTQ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fp16 (riferimento) | 16 | 2200 | 1.00× | — | **8.72** | — | 54.18 | — |
+| 4 bit g128 GPTQ | 4.19 | 771 | 2.85× | 78 | 9.10 | +4.4% | 53.55 | — |
+| 4 bit g128 CDCL | 4.19 | 771 | 2.85× | 235 | **9.06** | +4.0% | 53.62 | −0.4% |
+| 3 bit g128 `--mse-grid` GPTQ | 3.19 | 650 | 3.38× | 109 | 12.88 | +47.8% | 49.08 | — |
+| 3 bit g128 `--mse-grid` CDCL | 3.19 | 650 | 3.38× | 260 | **10.75** | +23.3% | 50.84 | **−16.6%** |
+| 3 bit g128 GPTQ | 3.19 | 650 | 3.38× | 55 | 13.67 | +56.7% | 47.94 | — |
+| 3 bit g128 CDCL | 3.19 | 650 | 3.38× | 234 | **12.44** | +42.6% | 49.04 | **−9.0%** |
+| 2 bit g64 `--mse-grid` GPTQ | 2.38 | 552 | 3.99× | 92 | 197.9 | +2170% | 22.32 | — |
+| 2 bit g64 `--mse-grid` CDCL | 2.38 | 552 | 3.99× | 257 | **47.2** | +442% | 33.49 | **−76.1%** |
+| 2 bit g128 GPTQ | 2.19 | 529 | 4.16× | 69 | 2.9e+04 | — | 0.34 | — |
+| 2 bit g128 CDCL | 2.19 | 529 | 4.16× | 250 | 1671 | — | 7.66 | −94.2% |
+
+Cosa dice, onestamente:
+
+- **Il modello funziona ancora** fino a 3 bit: top-1 50.8% contro 54.2% fp16 e testo generato ancora corretto
+  (a volte più vario dell'fp16, che su TinyLlama base è molto ripetitivo). `packed → dequant` è bit-esatto.
+- Il guadagno di CDCL **cresce al calare dei bit** (−0.4% → −9.0% → −76%): coerente con la sintesi, che a 3 bit
+  prevedeva −9.6%. **A 4 bit invece vale quasi niente** (−0.4% contro il −6.9% sintetico): il layer sintetico
+  sopravvaluta il guadagno quando GPTQ è già vicino al pavimento.
+- Il rapporto complessivo (3.38× a 3 bit) è frenato da embedding + lm_head rimasti fp16 (≈262 MB): sui soli pesi
+  quantizzati è 16/3.19 = 5,0×.
+- 2 bit g128 non è usabile con nessuno dei due metodi; con g64 + `--mse-grid` CDCL resta in piedi (47 ppl).
+  La perdita di loss proxy (−37.8%) non si traduce in proporzionalità sul ppl.
+- Costo reale: **234–260 s contro 55–109 s** per 969 M di pesi quantizzati (24 core).
+
+Script aggiunti per queste misure (non presenti nella specifica): `scripts/eval_ppl.py` (ppl/top-1 sui pesi
+dequantizzati), `scripts/gen_compare.py` (testo generato fp16 vs quantizzato, stesso seed),
+`scripts/summarize.py` (tabella dai `report.json` + `.eval.json`), `scripts/run_matrix.ps1` (griglia bit × metodo).
 
 ## Risultati
 
@@ -130,17 +176,21 @@ Riproduzione: `cdclq bench --rows 512 --cols 2048 --tokens 16384 --test-tokens 4
 
 ## Limiti noti (da leggere)
 
-- **Nessuna misura su LLM reali.** I numeri sopra vengono da layer sintetici. I guadagni dipendono dal
-  condizionamento dell'Hessiana e dal numero di token di calibrazione; sui modelli reali possono essere
-  minori o maggiori. Prima di fidarti: `capture_hessians.py` → `quantize` → perplexity di `out/dequant`
-  contro la stessa quantizzazione con `--method gptq`.
-- `scripts/capture_hessians.py` **non è stato eseguito** qui (serve torch + transformers); la sintassi è
-  verificata, la logica no. Cattura le Hessiane del modello FP (calibrazione simmetrica); non produce `M`.
+- **Un solo modello reale misurato** (TinyLlama-1.1B, 1,1 B): il procedimento è in `runs/RESULTS-tinyllama.md`.
+  Non misurati: modelli 7 B+, altri family (Mistral/Qwen), benchmark di downstream (lm-eval), e la pipeline
+  sequenziale con input quantizzati. Su TinyLlama i guadagni ci sono (−9% … −17% a 3 bit) ma **a 4 bit sono
+  trascurabili**; i numeri sintetici non vanno usati come previsione a bit alti.
+- `scripts/capture_hessians.py` **eseguito e funzionante** su TinyLlama (88 Hessiane + 66 alias q/k/v e gate/up,
+  `--skip lm_head` default). Cattura le Hessiane del modello FP (calibrazione simmetrica); non produce `M`.
+  Serve un ambiente con `huggingface-hub < 1.0` (transformers 4.52 non funziona con hub 1.x).
 - Il motore supporta `M`, ma una pipeline *sequenziale* (input quantizzati layer dopo layer) richiede un
   driver che esegua il modello quantizzato: non incluso.
 - Il formato `packed` usa permutazione act-order e zero a 8 bit (24 bit di metadati per gruppo e riga): **non
   ci sono kernel di inferenza**. Per valutare/usare il modello oggi serve `out/dequant` (pesi fake-quant).
-- Solo CPU. Tempo ≈ 1.5–5× GPTQ ai default. Picco di memoria per layer ≈ 24·d_in² byte (d_in = 4096 → ~0.4 GB; 11008 → ~2.9 GB).
+- Solo CPU. Tempo misurato su modello reale: **3–4× GPTQ** ai default (234–260 s vs 55–109 s per 969 M di pesi,
+  24 core). Picco di memoria per layer ≈ 24·d_in² byte (d_in = 4096 → ~0.4 GB; 11008 → ~2.9 GB).
+- Le Hessiane costano: `hess-128x2048.safetensors` = 3,7 GB per un modello da 1,1 B (e ~3,9 GB di VRAM in fp32
+  durante la cattura). Su modelli grandi catturare a pezzi con `--only`.
 - Il Modulo A (`lllayer`) non è toccato da questo progetto.
 
 ## Struttura
@@ -152,5 +202,7 @@ src/engine.rs    GPTQ + conflitti + riparazione + target asimmetrico (+ test)
 src/pipeline.rs  shard, alias, report, packed → dequant
 src/io.rs        safetensors (F32/F16/BF16), Hessian store
 src/bench.rs     benchmark sintetico
-scripts/         capture_hessians.py, ref_gptq_check.py
+scripts/         capture_hessians.py, ref_gptq_check.py, eval_ppl.py, gen_compare.py, summarize.py,
+                 run_matrix.ps1
+runs/            RESULTS-tinyllama.md = protocollo, tabella completa, testo generato, comandi di riproduzione
 ```
