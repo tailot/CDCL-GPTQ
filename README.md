@@ -1,208 +1,276 @@
-# cdclq — CDCL-GPTQ (Modulo B, corretto e implementato in Rust)
+# cdclq — CDCL-GPTQ (Module B, corrected and implemented in Rust)
 
-Quantizzatore *post-training* dei pesi per LLM (safetensors → INT2–INT8 a gruppi), scritto in Rust.
-Parte da GPTQ (Cholesky esatto, aggiornamenti lazy a blocchi) e poi **ripara i conflitti**: usa la
-decomposizione esatta della loss per trovare i sotto-blocchi peggiori e li migliora con due mosse
-esatte e monotone (discesa per coordinate sui codici interi + raffinamento in forma chiusa delle
-scale), alternandole fino a convergenza.
+A weight-only *post-training quantizer* for LLMs (safetensors → grouped INT2–INT8), written in Rust.
+It starts from GPTQ (exact Cholesky factorisation, blocked lazy updates) and then **repairs the
+conflicts**: it exploits the exact decomposition of the proxy loss to locate the worst sub-blocks and
+improves them with two exact, monotone moves — coordinate descent over integer codes plus a
+closed-form refit of the group scales — alternated until convergence.
 
-**Risultato misurato su un LLM reale (TinyLlama-1.1B, WikiText-2, stessi bit, stessa griglia, stesso
-ordinamento, stessa dampatura):** perplexity ridotta del **−9.0% a 3 bit** e **−16.6% a 3 bit con
-`--mse-grid`** rispetto a GPTQ, a parità di compressione (3.19 bit/peso → modello 3,38× più piccolo), al costo
-di **~3–4× il tempo** di GPTQ. A 2 bit la differenza è qualitativa: GPTQ produce un modello morto (ppl 29 000),
-CDCL con `--group 64 --mse-grid` lo porta a 47. Su layer sintetico il guadagno era −6% … −17%; vedi "Risultati
-su un LLM reale" e "Risultati" (sintetico).
+Both moves are *exact* with respect to the layer objective: every accepted update provably lowers
+`tr(E H Eᵀ)`, and the loss tracked during quantization is verified by tests against an independent
+direct evaluation. Nothing here is a heuristic retry/rollback scheme.
 
-## Cosa è stato corretto rispetto alla specifica
+**Measured on a real LLM (TinyLlama-1.1B, WikiText-2 test; identical bits, group size, column order
+and damping for both methods):** perplexity reduced by **−9.0% at 3 bits** and **−16.6% at 3 bits
+with `--mse-grid`** relative to GPTQ, at *identical* model size (3.19 effective bits/weight → 3.38×
+smaller checkpoint), for **~3–4× the wall-clock time** of GPTQ. At 2 bits the difference is
+qualitative rather than quantitative: plain GPTQ yields a dead model (ppl 29,000) while CDCL with
+`--group 64 --mse-grid` keeps it at 47 ppl. On synthetic layers the gain was −6% … −17%; see
+"Results on a real model" below and the "3-bit corner case" section for why the synthetic numbers
+must not be extrapolated to 4 bits.
 
-| # | Specifica | Problema | Qui |
+## What was fixed relative to the specification
+
+| # | Specification | Problem | Here |
 |---|---|---|---|
-| 1 | Pseudocodice: aggiornamenti con `H_inv` piena e statica | Non è GPTQ: manca l'aggiornamento di Schur dopo ogni colonna; le compensazioni risultano sbagliate | Fattore di Cholesky **superiore** `U` di `H⁻¹` (`H⁻¹ = UᵀU`) calcolato con il trucco del flip (1 Cholesky + 1 inversa triangolare). Test: `UᵀU·H = I`; i codici coincidono al **100%** con un GPTQ numpy float64 indipendente (`scripts/ref_gptq_check.py`) |
-| 2 | Dopo 2 retry falliti si ripristina `checkpoint_W` e si esce | Il sotto-blocco resta **non quantizzato** (in virgola mobile) | Nessun retry né rollback: la riparazione è monotona e non può lasciare pesi non quantizzati |
-| 3 | "Clausola" che forza l'arrotondamento opposto sul peso peggiore | Per costruzione *peggiora* quel peso; nessuna garanzia sul totale | Minimizzazione **esatta** per coordinata: il punto della griglia più vicino a `ŵⱼ + gⱼ/Hⱼⱼ` (gradiente esatto `g = eH`) |
-| 4 | Conflitto = errore relativo vs `‖WX‖` | Segnale rumoroso, calcolato a parte, non lega al costo reale | Decomposizione **esatta** `L = Σⱼ εⱼ²`, `εⱼ = (w_cur − q)/Uⱼⱼ` (non negativa, gratis nel passaggio GPTQ, verificata da test) |
-| 5 | `C_ij` per elemento con gradiente su token strutturali | Costoso (gradiente per elemento), maschera non strutturata (indici sparsi) | Criticità per **gruppo di colonne** `H_jj·‖W_:j‖²` (saliency OBS), gruppi interi a 8 bit. I token strutturali pesano nell'Hessiana (`--struct-weight` nello script di cattura). Il gradiente per elemento **non** è implementato |
-| 6 | Propagazione cross-layer `X ← X + βΔY` | Il segno riporta l'input al valore FP: il layer successivo ottimizza come se il precedente fosse perfetto, senza compensare | Calibrazione **asimmetrica** esatta: `W* = W·M·H̃⁻¹` con `M = X X̃ᵀ` (equazioni normali). Nel motore e validata in sintetico; lo script di cattura **non** produce ancora `M` |
-| 7 | "INT3" con 5% a INT8 | I bit effettivi non erano contati | Il report dà bit di codici e bit totali (scala f16 + zero 8 bit per gruppo e riga); lo scheletro alza i bit/peso e il benchmark lo segnala |
-| 8 | Gruppi, scale, damping, batch update `...` | Non specificati | Implementati e configurabili |
+| 1 | Pseudocode updating with a full, static `H_inv` | Not GPTQ: no Schur-complement update after each column, so the compensations are wrong | **Upper** Cholesky factor `U` of `H⁻¹` (`H⁻¹ = UᵀU`), computed with the flip trick (1 Cholesky + 1 triangular inverse). Test: `UᵀU·H = I`; codes match an independent float64 numpy GPTQ **exactly (100%)** (`scripts/ref_gptq_check.py`) |
+| 2 | After 2 failed retries restore `checkpoint_W` and exit | The sub-block is left **unquantized** (still floating point) | No retry, no rollback: the repair is monotone and can never leave a weight unquantized |
+| 3 | "Clause" forcing the opposite rounding on the worst weight | By construction it *worsens* that weight; no guarantee on the total | **Exact** per-coordinate minimisation: the grid point nearest `ŵⱼ + gⱼ/Hⱼⱼ`, with the exact block gradient `g = E H` |
+| 4 | Conflict = relative error vs `‖WX‖` | Noisy signal, computed separately, not tied to the actual cost | Exact decomposition `L = Σⱼ εⱼ²`, `εⱼ = (w_cur − q)/Uⱼⱼ` (non-negative, free during the GPTQ pass, verified by a test) |
+| 5 | Element-wise `C_ij` with a gradient over structural tokens | Expensive (per-element gradient), unstructured mask (scattered indices) | Criticality per **column group** `H_jj·‖W_:j‖²` (OBS saliency): whole groups kept at 8 bits. Structural tokens are instead folded into the Hessian (`--struct-weight` in the capture script). The element-wise gradient is **not** implemented |
+| 6 | Cross-layer propagation `X ← X + βΔY` | The sign pushes the input back to its FP value: the next layer optimizes as if the previous one were perfect, without compensating | Exact **asymmetric calibration**: `W* = W·M·H̃⁻¹` with `M = X X̃ᵀ` (normal equations). Implemented in the engine and validated on synthetic data; the capture script does **not** yet emit `M` |
+| 7 | "INT3" with 5% at INT8 | Effective bits were never counted | The report gives both code bits and total bits (f16 scale + 8-bit zero point per row/group); the skeleton raises bits/weight and the benchmark reports it |
+| 8 | Groups, scales, damping, batch update `...` | Left unspecified | Implemented and configurable |
 
-## Algoritmo (per layer `W ∈ R^{d_out×d_in}`, `H = XXᵀ`)
+## Algorithm (per layer `W ∈ R^{d_out×d_in}`, `H = X Xᵀ`)
 
-1. **Ordinamento colonne:** gruppi "scheletro" protetti (se `--skeleton-pct > 0`), poi act-order.
-2. **Fattorizzazione:** `U` con `H⁻¹ = UᵀU` (f64, blocchi, parallela). Condivisa tra layer che
-   hanno lo stesso input (q/k/v, gate/up) quando l'ordinamento coincide.
-3. **Passata GPTQ** a blocchi di 128 colonne con aggiornamento lazy (GEMM). Le righe sono
-   indipendenti → parallelizzate con rayon. Fornisce `εⱼ²` per colonna.
-4. **Conflitti:** i sotto-blocchi con loss maggiore (`--refine-frac`, default tutti).
-5. **Riparazione** (`--passes`, arresto anticipato con `--tol`): alterna
-   - **raffinamento scale:** con `u = q − z`, `Δs = (g·u)/(u H_CC uᵀ)` (forma chiusa, scala arrotondata a f16);
-   - **discesa per coordinate** sui codici interi, con gradiente esatto del blocco.
+The objective is the standard GPTQ proxy loss, which upper-bounds the true output error of the layer
+(`E = W − Ŵ`):
 
-   Ogni mossa non può aumentare la loss (testato: la loss tracciata coincide con quella calcolata
-   direttamente, e `loss_final ≤ loss_gptq`). Ogni layer riporta anche `loss_gptq`: ciò che GPTQ
-   avrebbe ottenuto con le stesse impostazioni.
-
-## Installazione
-
-Serve Rust (https://rustup.rs). Le dipendenze sono fissate in `Cargo.toml`/`Cargo.lock` (compatibili con Rust ≥ 1.75).
-
-```bash
-cargo build --release          # binario: target/release/cdclq (Windows: target\release\cdclq.exe)
-cargo test --release           # 9 test
+```text
+    L(Ŵ) = Σ_rows  e_r H e_rᵀ          (rows are independent → embarrassingly parallel)
 ```
 
-PowerShell, con ottimizzazioni per la CPU locale (facoltativo): `$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release`.
-Un binario Linux x86_64 già compilato è in `dist/linux-x86_64/cdclq`. I kernel GEMM usano AVX/FMA con
-rilevamento a runtime.
+1. **Column order.** Protected "skeleton" groups first, if `--skeleton-pct > 0`, ranked by the OBS
+   criticality `H_jj · ‖W_:j‖²`; then act-order (descending `H_jj`) or natural order. Whole groups are
+   protected so that a group's scale/zero-point stay contiguous.
+2. **Factorisation.** Damping (`--damp × mean(diag H)`), dead columns (zero activations) get a unit
+   diagonal, then `U` with `H⁻¹ = UᵀU` in f64 (blocked, parallel). Shared between layers fed by the
+   same input tensor (q/k/v, gate/up) whenever the permutation matches — one Cholesky per distinct
+   input, not per linear layer.
+3. **GPTQ pass** over blocks of `--block` columns with lazy batch updates (one GEMM per block instead
+   of one rank-1 update per column). Rows are independent, so they are chunked and run under rayon.
+   This pass also emits `εⱼ²` per column at no extra cost.
+4. **Conflict selection.** The sub-blocks (`--sub_block` columns wide) with the largest exact loss
+   contribution; `--refine-frac` is the fraction kept (default: all of them).
+5. **Repair** (`--passes`, early stop when a pass improves the loss by less than `--tol`), alternating
+   - **scale refit:** with `u = q − z` the loss is quadratic in the scale, so
+     `Δs = (g·u)/(u H_CC uᵀ)` in closed form; the new scale is rounded to f16 and accepted only if it
+     strictly decreases the loss;
+   - **coordinate descent over the integer codes**, using the exact block gradient: the 1-D minimiser
+     on the grid is the point nearest `ŵⱼ + gⱼ/Hⱼⱼ`, and the gradient is updated incrementally.
 
-## Uso
+   Neither move can increase the loss (tested: the tracked loss matches a direct evaluation, and
+   `loss_final ≤ loss_gptq`). Every layer also reports `loss_gptq`, i.e. what GPTQ alone would have
+   achieved under exactly the same settings — that is the honest A/B baseline inside one run.
+
+## Installation
+
+Rust is required (https://rustup.rs). Dependencies are pinned in `Cargo.toml`/`Cargo.lock` and build
+with Rust ≥ 1.75.
 
 ```bash
-# 1) Hessiane di calibrazione (PyTorch + transformers; vedi il docstring per memoria e --only)
-python scripts/capture_hessians.py --model ./modello --text calib.txt --out hess.safetensors \
+cargo build --release          # binary: target/release/cdclq (Windows: target\release\cdclq.exe)
+cargo test --release           # 9 tests
+```
+
+On PowerShell, with local-CPU codegen (optional): `$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release`.
+A prebuilt Linux x86_64 binary is in `dist/linux-x86_64/cdclq`. The GEMM kernels use AVX/FMA selected
+at runtime.
+
+## Usage
+
+```bash
+# 1) calibration Hessians (PyTorch + transformers; see the docstring for memory and --only)
+python scripts/capture_hessians.py --model ./model --text calib.txt --out hess.safetensors \
        --nsamples 128 --seqlen 2048 [--struct-chars "(){}=<>" --struct-weight 4]
 
-# 2) Quantizzazione
+# 2) quantization
 cdclq quantize --weights model.safetensors --hessians hess.safetensors --out-dir out \
-       --bits 3 --group 128            # default: act-order, riparazione completa
+       --bits 3 --group 128            # defaults: act-order on, full repair
 
-# 3) Output
-#   out/dequant/<shard>.safetensors  pesi dequantizzati, stesso dtype (per valutare in HF/lm-eval)
-#   out/packed/<shard>.safetensors   modello bit-packed (qweight, scales f16, qzeros u8, perm, gbits, gsize)
-#   out/report.json                  loss GPTQ vs finale, bit, tempi per layer
-cdclq dequant --input out/packed/model.safetensors --output ricostruito.safetensors
+# 3) outputs
+#   out/dequant/<shard>.safetensors  dequantized weights, original dtype (for HF / lm-eval harnesses)
+#   out/packed/<shard>.safetensors   bit-packed model (qweight, f16 scales, u8 qzeros, perm, gbits, gsize)
+#   out/report.json                  GPTQ vs final loss, bits and timings per layer
+cdclq dequant --input out/packed/model.safetensors --output rebuilt.safetensors
 
-# 4) valutazione (ppl + top-1 su testo held-out, pesi fake-quant) e testo generato
-python scripts/eval_ppl.py --model ./modello --text test.txt --dequant out/dequant/model.safetensors \
+# 4) evaluation (ppl + top-1 on held-out text, fake-quant weights) and generated text
+python scripts/eval_ppl.py --model ./model --text test.txt --dequant out/dequant/model.safetensors \
        --json out.eval.json
-python scripts/gen_compare.py --model ./modello --dequant out/dequant/model.safetensors --labels cdcl
-python scripts/summarize.py            # tabella markdown da tutti i report.json + *.eval.json in runs/
+python scripts/gen_compare.py --model ./model --dequant out/dequant/model.safetensors --labels cdcl
+python scripts/summarize.py            # markdown table from every report.json + *.eval.json under runs/
 ```
 
-Opzioni principali (`cdclq quantize --help`): `--bits`, `--group` (0 = una scala per riga),
-`--damp`, `--no-act-order`, `--mse-grid`, `--skeleton-pct/--skeleton-bits`,
-`--method gptq|cdcl` (per confronto), `--passes`, `--tol`, `--refine-frac`, `--no-refit-scales`,
-`--only/--skip` (sottostringhe), `--threads`. Con più shard: `--weights a.safetensors b.safetensors`
-(l'output mantiene i nomi dei file). Le Hessiane sono cercate come `<nome tensore senza .weight>.H`
-(con alias da metadato `aliases`).
+Main options (`cdclq quantize --help`): `--bits`, `--group` (0 = one scale per row), `--damp`,
+`--no-act-order`, `--mse-grid`, `--skeleton-pct/--skeleton-bits`, `--method gptq|cdcl` (for A/B
+comparison), `--passes`, `--tol`, `--refine-frac`, `--sub-block`, `--cd-sweeps`, `--no-refit-scales`,
+`--only/--skip` (substring filters), `--threads`. For multiple shards:
+`--weights a.safetensors b.safetensors` (output keeps the input file names). Hessians are looked up
+as `<tensor name without .weight>.H`, with shared inputs resolved through the `aliases` metadata entry.
 
-Profili di velocità: `--passes 2 --refine-frac 0.5` (veloce), `--passes 4` (bilanciato), default (completo).
+Speed profiles: `--passes 2 --refine-frac 0.5` (fast), `--passes 4` (balanced), defaults (full).
 
-## Risultati su un modello reale (TinyLlama-1.1B)
+## Results on a real model (TinyLlama-1.1B)
 
-Prima verifica su un LLM reale (macchina: 24 core CPU, RTX 5070 Ti usata solo per Hessiane e valutazione).
-Modello `TinyLlama/TinyLlama_v1.1` (1,1 B parametri, fp16, 2200 MB), calibrazione WikiText-2 train
-(128 × 2048 token), valutazione WikiText-2 **test** (334 521 token, chunk da 1024, pesi fake-quant di
-`out/dequant`). `--group 128 --damp 0.01`, act-order, GPTQ e CDCL con impostazioni identiche. Dettaglio completo,
-campioni di testo generato e comandi di riproduzione: `runs/RESULTS-tinyllama.md`.
+First measurement on a real LLM (machine: 24-core CPU; the RTX 5070 Ti is used only for Hessian
+capture and evaluation). Model `TinyLlama/TinyLlama_v1.1` (1.1 B parameters, fp16, 2200 MB),
+calibration on WikiText-2 **train** (128 × 2048 tokens), evaluation on WikiText-2 **test**
+(334,521 tokens in non-overlapping chunks of 1024) using the fake-quant weights from `out/dequant`.
+`--group 128 --damp 0.01`, act-order on; GPTQ and CDCL otherwise identical. Full protocol, generated
+text samples and reproduction commands: `runs/RESULTS-tinyllama.md`.
 
-| configurazione | bit/peso | modello (MB) | vs fp16 | tempo (s) | perplexity | vs fp16 | top-1 % | vs GPTQ |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| fp16 (riferimento) | 16 | 2200 | 1.00× | — | **8.72** | — | 54.18 | — |
-| 4 bit g128 GPTQ | 4.19 | 771 | 2.85× | 78 | 9.10 | +4.4% | 53.55 | — |
-| 4 bit g128 CDCL | 4.19 | 771 | 2.85× | 235 | **9.06** | +4.0% | 53.62 | −0.4% |
-| 3 bit g128 `--mse-grid` GPTQ | 3.19 | 650 | 3.38× | 109 | 12.88 | +47.8% | 49.08 | — |
-| 3 bit g128 `--mse-grid` CDCL | 3.19 | 650 | 3.38× | 260 | **10.75** | +23.3% | 50.84 | **−16.6%** |
-| 3 bit g128 GPTQ | 3.19 | 650 | 3.38× | 55 | 13.67 | +56.7% | 47.94 | — |
-| 3 bit g128 CDCL | 3.19 | 650 | 3.38× | 234 | **12.44** | +42.6% | 49.04 | **−9.0%** |
-| 2 bit g64 `--mse-grid` GPTQ | 2.38 | 552 | 3.99× | 92 | 197.9 | +2170% | 22.32 | — |
-| 2 bit g64 `--mse-grid` CDCL | 2.38 | 552 | 3.99× | 257 | **47.2** | +442% | 33.49 | **−76.1%** |
-| 2 bit g128 GPTQ | 2.19 | 529 | 4.16× | 69 | 2.9e+04 | — | 0.34 | — |
-| 2 bit g128 CDCL | 2.19 | 529 | 4.16× | 250 | 1671 | — | 7.66 | −94.2% |
+| configuration | bits/weight | model (MB) | vs fp16 | time (s) | proxy-loss gain | perplexity | vs fp16 | top-1 % | vs GPTQ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fp16 (reference) | 16 | 2200 | 1.00× | — | — | **8.72** | — | 54.18 | — |
+| 4 bit g128 GPTQ | 4.19 | 771 | 2.85× | 78 | — | 9.10 | +4.4% | 53.55 | — |
+| 4 bit g128 CDCL | 4.19 | 771 | 2.85× | 235 | −8.3% | **9.06** | +4.0% | 53.62 | −0.4% |
+| 3 bit g128 `--mse-grid` GPTQ | 3.19 | 650 | 3.38× | 109 | — | 12.88 | +47.8% | 49.08 | — |
+| 3 bit g128 `--mse-grid` CDCL | 3.19 | 650 | 3.38× | 260 | −8.2% | **10.75** | +23.3% | 50.84 | **−16.6%** |
+| 3 bit g128 GPTQ | 3.19 | 650 | 3.38× | 55 | — | 13.67 | +56.7% | 47.94 | — |
+| 3 bit g128 CDCL | 3.19 | 650 | 3.38× | 234 | −13.9% | **12.44** | +42.6% | 49.04 | **−9.0%** |
+| 2 bit g64 `--mse-grid` GPTQ | 2.38 | 552 | 3.99× | 92 | — | 197.9 | +2170% | 22.32 | — |
+| 2 bit g64 `--mse-grid` CDCL | 2.38 | 552 | 3.99× | 257 | −10.4% | **47.2** | +442% | 33.49 | **−76.1%** |
+| 2 bit g128 GPTQ | 2.19 | 529 | 4.16× | 69 | — | 2.9e+04 | — | 0.34 | — |
+| 2 bit g128 CDCL | 2.19 | 529 | 4.16× | 250 | −37.8% | 1671 | — | 7.66 | −94.2% |
 
-Cosa dice, onestamente:
+`bits/weight` includes the per-row/per-group metadata (f16 scale + 8-bit zero point = 24 bits per
+(row, group)); at `--group 128` that is 3.00 code bits + 0.19 metadata bits. The **vs fp16** ratio is
+computed on the whole `packed` file, so it includes `embed_tokens`, `lm_head`, norms and biases left
+in fp16 (~131 M parameters ≈ 262 MB). On the quantized weights alone the ratio is 16/3.19 = **5.0×**.
 
-- **Il modello funziona ancora** fino a 3 bit: top-1 50.8% contro 54.2% fp16 e testo generato ancora corretto
-  (a volte più vario dell'fp16, che su TinyLlama base è molto ripetitivo). `packed → dequant` è bit-esatto.
-- Il guadagno di CDCL **cresce al calare dei bit** (−0.4% → −9.0% → −76%): coerente con la sintesi, che a 3 bit
-  prevedeva −9.6%. **A 4 bit invece vale quasi niente** (−0.4% contro il −6.9% sintetico): il layer sintetico
-  sopravvaluta il guadagno quando GPTQ è già vicino al pavimento.
-- Il rapporto complessivo (3.38× a 3 bit) è frenato da embedding + lm_head rimasti fp16 (≈262 MB): sui soli pesi
-  quantizzati è 16/3.19 = 5,0×.
-- 2 bit g128 non è usabile con nessuno dei due metodi; con g64 + `--mse-grid` CDCL resta in piedi (47 ppl).
-  La perdita di loss proxy (−37.8%) non si traduce in proporzionalità sul ppl.
-- Costo reale: **234–260 s contro 55–109 s** per 969 M di pesi quantizzati (24 core).
+Does the model still work? Yes, down to 3 bits: top-1 accuracy 50.84% vs 54.18% fp16, and generated
+text is still coherent (sometimes *more* varied than fp16, because vanilla TinyLlama is extremely
+repetitive). The `packed → dequant` round-trip is bit-exact: 201 tensors, same dtypes and shapes,
+`max |dequant − roundtrip| = 0`.
 
-Script aggiunti per queste misure (non presenti nella specifica): `scripts/eval_ppl.py` (ppl/top-1 sui pesi
-dequantizzati), `scripts/gen_compare.py` (testo generato fp16 vs quantizzato, stesso seed),
-`scripts/summarize.py` (tabella dai `report.json` + `.eval.json`), `scripts/run_matrix.ps1` (griglia bit × metodo).
+## The 3-bit question (read this before choosing a bit-width)
 
-## Risultati
+**3 bits is where CDCL-GPTQ pays off; 4 bits is not, and 2 bits is a different problem.** Measured on
+TinyLlama-1.1B, at constant storage:
 
-Layer sintetico 512×2048, 16384 token di calibrazione, 4096 **held-out**, 1 core, `--group 128`.
-Attivazioni correlate, con canali outlier e token "massivi". Errore = `‖Wx − Ŵx‖² / ‖Wx‖²` su token mai visti.
-Tutti i metodi condividono pesi, Hessiana, griglia, ordinamento e damping.
+| bit-width | GPTQ ppl | CDCL ppl | CDCL gain | verdict |
+|---|---:|---:|---:|---|
+| 4 bit g128 | 9.10 | 9.06 | **−0.4%** | not worth it: you pay 3× the time for a rounding error on ppl (fp16 is 8.72) |
+| 3 bit g128 | 13.67 | 12.44 | **−9.0%** | worth it |
+| 3 bit g128 `--mse-grid` | 12.88 | **10.75** | **−16.6%** | best configuration of the whole matrix |
+| 2 bit g64 `--mse-grid` | 197.9 | 47.2 | −76.1% | still not usable in practice, but qualitatively different |
+| 2 bit g128 | 29056 | 1671 | −94.2% | both methods fail; ignore this row |
 
-| 3 bit (3.19 bit/peso) | errore held-out | vs GPTQ | tempo |
+Why the gain is small at 4 bits and large at 3 bits:
+
+- **GPTQ is already near the error floor at 4 bits.** fp16 sits at 8.72 ppl, GPTQ at 9.10: only 4.4%
+  of headroom remains before the fp16 reference, so even an ideal repairer has almost nothing to win.
+  The proxy loss does drop (−8.3%), but that residual no longer dominates the perplexity — quantization
+  noise is not yet the bottleneck.
+- **At 3 bits quantization noise becomes the dominant error source**, which is exactly the regime the
+  repair targets: the proxy loss drops −13.9% and perplexity follows with −9.0%. The synthetic model
+  predicted −9.6% at 3 bits, so this is the one point where the synthetic benchmark was quantitatively
+  right.
+- **`--mse-grid` and the repair are complementary, not redundant.** With MSE-optimal clipping every
+  group starts from a better grid, and the code/scale alternation then exploits it further: GPTQ goes
+  13.67 → 12.88 (−5.8%) with the grid alone, CDCL goes 12.44 → 10.75 (−13.6%). Combined versus plain
+  GPTQ at default settings that is **13.67 → 10.75 = −21.4%** at identical size. In the synthetic
+  benchmark the two moves were worth only −1.9% and −0.6% individually, but −9.6% alternated; on the
+  real model the interaction is even stronger.
+- **The compression ratio itself is capped by non-linear weights, not by the bit-width.** At 3 bits the
+  checkpoint only reaches 3.38× because `embed_tokens` + `lm_head` (65.5 M parameters each) stay fp16.
+  Going from 4 to 3 bits buys you just 0.9× of overall ratio; changing `--group 128` → `--group 64
+  --mse-grid` buys ~600× in ppl at 2 bits, and `--mse-grid` alone buys −5.8% at 3 bits. **Grid and
+  group size dominate the repair in the low-bit regime; the repair dominates in the mid-bit regime.**
+
+Cost of the win: one-off quantization time, 234–260 s vs 55–109 s for 969 M quantized parameters on
+24 CPU cores. Nothing at inference time — the packed artifact is bit-identical in size to GPTQ's.
+
+Recommendation: use **3 bit + `--mse-grid`** (or `--group 64 --mse-grid` if you can afford the extra
+metadata bits); skip CDCL at 4 bit (`--method gptq`) unless the proxy loss itself is what you care
+about; treat 2 bit as research, not as a deployable configuration.
+
+## Results (synthetic layer)
+
+Synthetic layer 512×2048, 16384 calibration tokens, 4096 **held-out** tokens, 1 core, `--group 128`.
+Correlated activations with channel outliers and "massive" tokens. Error = `‖Wx − Ŵx‖² / ‖Wx‖²` on
+unseen tokens. All methods share the weights, Hessian, grid, ordering and damping.
+
+| 3 bit (3.19 bits/weight) | held-out error | vs GPTQ | time |
 |---|---:|---:|---:|
 | RTN | 5.74e-2 | +826% | 0.01 s |
 | **GPTQ** | 6.19e-3 | — | 0.46 s |
-| solo raffinamento scale | 6.08e-3 | −1.9% | 0.83 s |
-| solo discesa per coordinate | 6.15e-3 | −0.6% | 0.87 s |
-| CDCL veloce (50% sotto-blocchi, 2 passate) | 5.99e-3 | −3.3% | 0.85 s |
-| CDCL bilanciato (4 passate) | 5.72e-3 | −7.6% | 1.30 s |
-| **CDCL default** (fino a 10 passate) | **5.60e-3** | **−9.6%** | 2.36 s |
+| scale refit only | 6.08e-3 | −1.9% | 0.83 s |
+| coordinate descent only | 6.15e-3 | −0.6% | 0.87 s |
+| CDCL fast (50% sub-blocks, 2 passes) | 5.99e-3 | −3.3% | 0.85 s |
+| CDCL balanced (4 passes) | 5.72e-3 | −7.6% | 1.30 s |
+| **CDCL default** (up to 10 passes) | **5.60e-3** | **−9.6%** | 2.36 s |
 
-Le due mosse da sole valgono poco; **insieme** (alternate) rendono molto: è l'alternanza codici ↔ scale
-che produce il guadagno. La discesa per coordinate non basta, contrariamente a quanto la specifica lasciava supporre.
+The two moves are worth little on their own; **alternated** they deliver most of the gain — it is the
+codes ↔ scales interplay that matters. Coordinate descent alone is not enough, contrary to what the
+specification implied.
 
-| Configurazione (held-out, vs GPTQ con le stesse impostazioni) | GPTQ | CDCL default | variazione |
+| Configuration (held-out, vs GPTQ with identical settings) | GPTQ | CDCL default | change |
 |---|---:|---:|---:|
 | 4 bit, g128 | 1.378e-3 | 1.284e-3 | **−6.9%** |
 | 3 bit, g128 | 6.195e-3 | 5.602e-3 | **−9.6%** |
-| 3 bit, g128, `--mse-grid` (anche per GPTQ) | 4.857e-3 | 4.264e-3 | **−12.2%** |
+| 3 bit, g128, `--mse-grid` (also for GPTQ) | 4.857e-3 | 4.264e-3 | **−12.2%** |
 | 2 bit, g64 | 2.380e-2 | 1.968e-2 | **−17.3%** |
 
-Altri esperimenti (stesso layer, 3 bit):
+Do not use these to predict real-model behaviour at high bit-widths: the synthetic −6.9% at 4 bits
+became −0.4% of perplexity on TinyLlama, because a single synthetic layer has no fp16 floor to hit and
+its Hessian is far less ill-conditioned than a trained transformer's.
 
-- **Scheletro 5% a 8 bit (3.5 bit/peso):** GPTQ+scheletro 5.23e-4, CDCL+scheletro 4.33e-4 (−17.2%).
-  L'enorme calo rispetto a "senza scheletro" dipende dagli outlier sintetici e non è trasferibile ai modelli reali.
-- **Input quantizzati (rumore relativo 0.08):** GPTQ simmetrico 1.330e-2 → GPTQ con target asimmetrico
-  1.269e-2 (−4.6%) → CDCL con target asimmetrico 1.206e-2 (**−9.3%**).
-- **Layer 512×4096** (6144 token, solo 1.5× la dimensione: calibrazione sovra-adattata, errore held-out
-  ≈2× quello di calibrazione): CDCL default −6.2% in 10.5 s contro 3.1 s di GPTQ.
+Other experiments (same layer, 3 bit):
 
-Riproduzione: `cdclq bench --rows 512 --cols 2048 --tokens 16384 --test-tokens 4096 [--bits 4] [--group 64] [--mse-grid] [--skeleton-pct 5] [--asym-noise 0.08]`.
+- **5% skeleton at 8 bit (3.5 bits/weight):** GPTQ+skeleton 5.23e-4, CDCL+skeleton 4.33e-4 (−17.2%).
+  The huge drop versus "no skeleton" is an artefact of the synthetic outliers and does not transfer to
+  real models.
+- **Quantized inputs (relative noise 0.08):** symmetric GPTQ 1.330e-2 → GPTQ with asymmetric target
+  1.269e-2 (−4.6%) → CDCL with asymmetric target 1.206e-2 (**−9.3%**).
+- **Layer 512×4096** (6144 tokens, only 1.5× the dimension: calibration overfits, held-out error ≈2×
+  calibration error): CDCL default −6.2% in 10.5 s against 3.1 s for GPTQ.
 
-## Verifiche eseguite
+Reproduction: `cdclq bench --rows 512 --cols 2048 --tokens 16384 --test-tokens 4096 [--bits 4] [--group 64] [--mse-grid] [--skeleton-pct 5] [--asym-noise 0.08]`.
 
-- 9 test unitari: Cholesky a blocchi, `UᵀU·H = I`, GEMM parallelo = seriale, pack/unpack a bit misti,
-  decomposizione esatta della loss, monotonia + contabilità esatta della riparazione, permutazione/scheletro,
-  caso asimmetrico `M = H ⇒ W* = W`.
-- Confronto con un GPTQ numpy float64 indipendente: **codici identici al 100%**, loss relativa differente 0.
-- Test end-to-end del CLI su un modello giocattolo (alias q/k/v, tensori 1-D e embedding passanti):
-  nomi/dtype/forme invariati, `packed → dequant` **bit-esatto** rispetto all'output diretto, loss riportata
-  uguale a un calcolo numpy indipendente (differenza relativa 3e-5).
+## Checks performed
 
-## Limiti noti (da leggere)
+- 9 unit tests: blocked Cholesky, `UᵀU·H = I`, parallel GEMM == serial GEMM, mixed bit-width
+  pack/unpack, exactness of the loss decomposition, monotonicity + exact bookkeeping of the repair,
+  skeleton/act-order permutation, asymmetric case `M = H ⇒ W* = W`.
+- Cross-check against an independent float64 numpy GPTQ: **identical codes (100%)**, relative loss
+  difference 0.
+- End-to-end CLI test on a toy model (q/k/v aliases, 1-D tensors and embeddings passed through):
+  names/dtypes/shapes preserved, `packed → dequant` **bit-exact** versus the direct output, reported
+  loss equal to an independent numpy computation (relative difference 3e-5).
 
-- **Un solo modello reale misurato** (TinyLlama-1.1B, 1,1 B): il procedimento è in `runs/RESULTS-tinyllama.md`.
-  Non misurati: modelli 7 B+, altri family (Mistral/Qwen), benchmark di downstream (lm-eval), e la pipeline
-  sequenziale con input quantizzati. Su TinyLlama i guadagni ci sono (−9% … −17% a 3 bit) ma **a 4 bit sono
-  trascurabili**; i numeri sintetici non vanno usati come previsione a bit alti.
-- `scripts/capture_hessians.py` **eseguito e funzionante** su TinyLlama (88 Hessiane + 66 alias q/k/v e gate/up,
-  `--skip lm_head` default). Cattura le Hessiane del modello FP (calibrazione simmetrica); non produce `M`.
-  Serve un ambiente con `huggingface-hub < 1.0` (transformers 4.52 non funziona con hub 1.x).
-- Il motore supporta `M`, ma una pipeline *sequenziale* (input quantizzati layer dopo layer) richiede un
-  driver che esegua il modello quantizzato: non incluso.
-- Il formato `packed` usa permutazione act-order e zero a 8 bit (24 bit di metadati per gruppo e riga): **non
-  ci sono kernel di inferenza**. Per valutare/usare il modello oggi serve `out/dequant` (pesi fake-quant).
-- Solo CPU. Tempo misurato su modello reale: **3–4× GPTQ** ai default (234–260 s vs 55–109 s per 969 M di pesi,
-  24 core). Picco di memoria per layer ≈ 24·d_in² byte (d_in = 4096 → ~0.4 GB; 11008 → ~2.9 GB).
-- Le Hessiane costano: `hess-128x2048.safetensors` = 3,7 GB per un modello da 1,1 B (e ~3,9 GB di VRAM in fp32
-  durante la cattura). Su modelli grandi catturare a pezzi con `--only`.
-- Il Modulo A (`lllayer`) non è toccato da questo progetto.
+## Known limitations (please read)
 
-## Struttura
+- **One real model measured** (TinyLlama-1.1B, 1.1 B); the procedure is in `runs/RESULTS-tinyllama.md`.
+  Not measured: 7 B+ models, other families (Mistral/Qwen), downstream benchmarks (lm-eval), and the
+  sequential pipeline with quantized inputs. On TinyLlama the gains are real (−9% … −17% at 3 bits) but
+  **negligible at 4 bits**; do not use the synthetic numbers as a prediction at high bit-widths.
+- `scripts/capture_hessians.py` **runs and works** on TinyLlama (88 Hessians + 66 q/k/v and gate/up
+  aliases, `--skip lm_head` by default). It captures the FP-model Hessians (symmetric calibration) and
+  does not produce `M`. It needs an environment with `huggingface-hub < 1.0` (transformers 4.52 does not
+  work with hub 1.x).
+- The engine supports `M`, but a *sequential* pipeline (quantized inputs layer after layer) needs a
+  driver that runs the quantized model; not included.
+- The `packed` format stores an act-order permutation and 8-bit zero points (24 metadata bits per row
+  and group): **there are no inference kernels**. To evaluate or serve the model today you need
+  `out/dequant` (fake-quant weights).
+- CPU only. Measured on a real model: **3–4× GPTQ** at defaults (234–260 s vs 55–109 s for 969 M
+  weights, 24 cores). Peak memory per layer ≈ 24·d_in² bytes (d_in = 4096 → ~0.4 GB; 11008 → ~2.9 GB).
+- Hessians are large: `hess-128x2048.safetensors` = 3.7 GB for a 1.1 B model (and ~3.9 GB of fp32 VRAM
+  during capture). On big models capture them in several passes with `--only`.
+- Module A (`lllayer`) is untouched by this project.
+
+## Layout
 
 ```
-src/linalg.rs    GEMM parallelo, Cholesky a blocchi, inversa triangolare, U di H⁻¹
-src/quant.rs     griglie, scale f16, bit-packing, QLayer
-src/engine.rs    GPTQ + conflitti + riparazione + target asimmetrico (+ test)
-src/pipeline.rs  shard, alias, report, packed → dequant
+src/linalg.rs    parallel GEMM, blocked Cholesky, triangular inverse, U of H⁻¹
+src/quant.rs     grids, f16 scales, bit packing, QLayer
+src/engine.rs    GPTQ + conflicts + repair + asymmetric target (+ tests)
+src/pipeline.rs  shards, aliases, report, packed → dequant
 src/io.rs        safetensors (F32/F16/BF16), Hessian store
-src/bench.rs     benchmark sintetico
+src/bench.rs     synthetic benchmark
 scripts/         capture_hessians.py, ref_gptq_check.py, eval_ppl.py, gen_compare.py, summarize.py,
                  run_matrix.ps1
-runs/            RESULTS-tinyllama.md = protocollo, tabella completa, testo generato, comandi di riproduzione
+runs/            RESULTS-tinyllama.md = protocol, full table, generated text, reproduction commands
 ```

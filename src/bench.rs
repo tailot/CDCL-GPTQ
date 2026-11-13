@@ -1,6 +1,14 @@
-//! Self-contained benchmark on synthetic layers (correlated activations with channel outliers and
-//! massive tokens). Every method gets the same weights, Hessian, grid, ordering and damping, and is
-//! evaluated on the calibration tokens AND on held-out tokens (relative output error).
+//! Self-contained benchmark on synthetic layers (correlated activations with channel outliers and massive tokens).
+//! Every method gets the same weights, Hessian, grid, ordering and damping, and is evaluated on the calibration tokens
+//! **and** on held-out tokens (relative output error).
+//!
+//! Why a synthetic benchmark at all, when the README also reports real-model numbers: it isolates the algorithm from
+//! any single architecture, runs in seconds instead of minutes, and — most importantly — makes both metrics available
+//! at once. On a real model only perplexity is cheap enough to measure repeatedly; here the proxy loss (what the
+//! optimizer minimizes) and the held-out output error (what actually matters) can be compared directly, which is how we
+//! know the proxy is a *faithful* objective rather than something being over-fitted. The synthetic gains do not transfer
+//! one-to-one to real models, so neither number should be used to predict the other; they are reported side by side for
+//! exactly that reason.
 
 use crate::engine::*;
 use crate::linalg::*;
@@ -13,7 +21,10 @@ use std::time::Instant;
 pub struct BenchArgs {
     pub rows: usize,
     pub cols: usize,
+    /// Calibration tokens. The Hessian rank is capped by this, so it must stay well above `cols` or the problem becomes
+    /// singular and damping stops being a mild regularizer.
     pub tokens: usize,
+    /// Held-out tokens, never seen by any method; the "held-out err" column comes from these.
     pub test_tokens: usize,
     pub seed: u64,
     /// If > 0: also run the asymmetric (quantized-input) experiment with this relative input noise.
@@ -23,6 +34,10 @@ pub struct BenchArgs {
     pub cfg: Config,
 }
 
+/// Activation generator mimicking transformer activations: a low-rank shared component (attention/MLP outputs are not
+/// full-rank), per-channel log-normal scaling (the origin of "outlier channels" that break naive 4-bit quantization),
+/// rare 20-60x outlier channels, additive noise so the Hessian is full rank, and ~2% "massive" tokens whose norm is 4x
+/// typical (the behaviour real LLMs show on BOS/rare tokens, which dominates a least-squares objective).
 struct ActGen {
     n: usize,
     rank: usize,
@@ -33,6 +48,7 @@ struct ActGen {
 impl ActGen {
     fn new(rng: &mut Rng, n: usize) -> Self {
         let rank = (n / 8).max(8);
+        // The `1/sqrt(rank)` factor keeps the product's variance O(1) as the rank grows.
         let a: Vec<f32> = (0..rank * n).map(|_| rng.normal() / (rank as f32).sqrt()).collect();
         let mut scale: Vec<f32> = (0..n).map(|_| (0.6 * rng.normal()).exp()).collect();
         for s in scale.iter_mut() {
@@ -43,6 +59,8 @@ impl ActGen {
         ActGen { n, rank, a, scale }
     }
 
+    /// Draw `tokens` activation rows (`t x n`). One GEMM for the low-rank part, then per-token scaling in a scalar loop
+    /// because the outlier/massive decisions are sequential RNG draws and must stay reproducible.
     fn sample(&self, rng: &mut Rng, tokens: usize) -> Vec<f32> {
         let (n, rank) = (self.n, self.rank);
         let z: Vec<f32> = (0..tokens * rank).map(|_| rng.normal()).collect();
@@ -61,6 +79,8 @@ impl ActGen {
     }
 }
 
+/// Synthetic weight matrix: per-row log-normal scale (real layers differ a lot row by row) plus rare 8x outliers.
+/// The generator is shared by every method, which is what makes the A/B comparison exact rather than statistical.
 fn gen_weights(rng: &mut Rng, rows: usize, n: usize) -> Vec<f32> {
     let mut w = vec![0f32; rows * n];
     for r in 0..rows {
@@ -77,6 +97,12 @@ fn gen_weights(rng: &mut Rng, rows: usize, n: usize) -> Vec<f32> {
 }
 
 /// `||W x - W_hat x~||^2 / ||W x||^2` over `t` tokens (`x`, `xt`: `t x n`).
+///
+/// The model-level metric: relative output error of the layer, normalized so it is comparable across layers and bit
+/// widths. Passing `x == xt` measures pure weight error; passing a noisy `xt` measures the *combined* effect of weight
+/// quantization and quantized inputs, which is what an asymmetric-calibration run is supposed to help with. Note this is
+/// computed on **held-out** tokens in the tables below: the proxy loss uses calibration data, so if the two disagree the
+/// objective is being over-fitted, and that disagreement is itself a result worth reporting.
 fn rel_err(w: &[f32], wq: &[f32], x: &[f32], xt: &[f32], rows: usize, n: usize, t: usize) -> f64 {
     let mut o1 = vec![0f32; rows * t];
     let mut o2 = vec![0f32; rows * t];
@@ -94,6 +120,8 @@ fn rel_err(w: &[f32], wq: &[f32], x: &[f32], xt: &[f32], rows: usize, n: usize, 
     num / den
 }
 
+/// One row of the report. `loss` is the proxy objective on calibration data, `calib`/`test` are relative output errors on
+/// calibration and held-out tokens, and `bpw` is measured (not nominal) bits per weight.
 struct Row {
     name: String,
     loss: f64,
@@ -103,6 +131,8 @@ struct Row {
     bpw: f64,
 }
 
+/// Render a markdown table with the comparison against `rows[base]` (always plain GPTQ) on the held-out column — the one
+/// number that must not be gamed by calibration. Also printed to stdout so a run can be pasted into the README verbatim.
 fn table(title: &str, rows: &[Row], base: usize) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "\n### {title}\n");
@@ -125,6 +155,16 @@ fn table(title: &str, rows: &[Row], base: usize) -> String {
     s
 }
 
+/// Run the whole benchmark and return the markdown report (also printed to stdout by `main`).
+///
+/// The comparison is designed so that no method gets an advantage it should not have: one weight matrix, one calibration
+/// Hessian, one test set, identical grid/ordering/damping through cloned configs. Each variant changes exactly one knob,
+/// which turns the table into an ablation rather than a leaderboard — you can see how much of the gain comes from the
+/// scale refit alone, from the coordinate descent alone, and from combining them (the two are complementary: each is
+/// around -1% separately and around -10% alternated).
+///
+/// `xcal` is deliberately capped at 4096 tokens for the *calibration* error column: it keeps the calibration and held-out
+/// columns on comparable footing instead of letting the training error look artificially good.
 pub fn run(a: &BenchArgs) -> Result<String> {
     let (rows, n) = (a.rows, a.cols);
     let mut rng = Rng::new(a.seed);
@@ -168,10 +208,14 @@ pub fn run(a: &BenchArgs) -> Result<String> {
     };
 
     // ---------------- main comparison at equal bits ----------------
+    // `base` is the user's config with the skeleton disabled: everything in this table must be equal-bits, and mixed
+    // precision would make "bits/weight" differ between rows and invalidate the comparison.
     let mut base = a.cfg.clone();
     base.skeleton_pct = 0.0;
     let mut gptq = base.clone();
     gptq.method = Method::Gptq;
+    // RTN gets act-order off because it ignores the Hessian entirely: permuting columns would only change which group a
+    // weight lands in, and leaving it on would suggest the ordering was helping RTN when it cannot be.
     let mut rtn_cfg = base.clone();
     rtn_cfg.act_order = false;
 
@@ -182,10 +226,14 @@ pub fn run(a: &BenchArgs) -> Result<String> {
         let secs = t0.elapsed().as_secs_f64();
         let (c, t) = eval(&wq);
         let g = effective_group(&rtn_cfg, n) as f64;
+        // loss 0.0 marks "no proxy loss reported": RTN never optimizes the objective, so a loss column for it would be
+        // misleading (the table renders 0 as "-").
         out.push(Row { name: "RTN (no compensation)".into(), loss: 0.0, calib: c, test: t, secs, bpw: rtn_cfg.bits as f64 + 24.0 / g });
     }
     out.push(run_one("GPTQ", &gptq, &h, None, &eval)?);
     // (name, repair fraction, sweeps, passes, scale refit)
+    // The two single-mechanism rows are the ablations; `tol = 0.0` in all variants forces a fixed number of passes so the
+    // cost is comparable instead of depending on when each variant happens to converge.
     let variants: [(&str, f64, usize, usize, bool); 4] = [
         ("ablation: scale refit only (3 passes)", 0.0, 1, 3, true),
         ("ablation: coordinate descent only (4 passes)", 1.0, 1, 4, false),
@@ -210,6 +258,9 @@ pub fn run(a: &BenchArgs) -> Result<String> {
     report.push_str(&table("Equal-bits comparison (same grid, ordering, damping)", &out, 1));
 
     // ---------------- skeleton (mixed precision) ----------------
+    // Reported separately, and never merged into the equal-bits table: promoting columns to 8 bits raises bits/weight, so
+    // its "gain" is bought with size. The reference row is the same GPTQ run without a skeleton, which lets the reader
+    // judge the trade rather than being shown an isolated improvement.
     if a.cfg.skeleton_pct > 0.0 {
         let mut g2 = gptq.clone();
         g2.skeleton_pct = a.cfg.skeleton_pct;
@@ -231,6 +282,15 @@ pub fn run(a: &BenchArgs) -> Result<String> {
     }
 
     // ---------------- asymmetric calibration (quantized inputs) ----------------
+    // Stand-in for a quantized-input pipeline (W4A8, AWQ-style activation schemes): the activations the layer will really
+    // see are `x~ = x + noise`, not `x`. The metric becomes `||W x - W_hat x~||`, and the first row — full-precision
+    // weights evaluated on noisy inputs — is the floor no quantizer can beat: if a method goes below it, the experiment is
+    // wrong rather than clever.
+    //
+    // Noise is scaled per channel by that channel's RMS, so quiet channels are not swamped and loud ones are not
+    // unrealistically punished; `--asym-noise` is therefore "fraction of each channel's own typical magnitude".
+    // Three variants separate the design choices: optimize against H~ only (symmetric target), against the asymmetric
+    // target `W* = W M H~^-1`, and that same target with the full CDCL repair.
     if a.asym_noise > 0.0 {
         let mut rms = vec![0f32; n];
         for t in 0..a.tokens {
@@ -278,6 +338,10 @@ pub fn run(a: &BenchArgs) -> Result<String> {
     }
 
     // ---------------- dump for the numpy reference cross-check ----------------
+    // Write a *plain GPTQ, no act-order* case to disk so scripts/ref_gptq_check.py can recompute `tr(E H E^T)` from the
+    // same codes/scales/zeros with PyTorch. A second, independent implementation agreeing on the loss is what rules out a
+    // bug in the incremental bookkeeping (a self-consistent Rust-only check could not). act-order is forced off because the
+    // reference script works in original column order.
     if let Some(dir) = &a.dump {
         std::fs::create_dir_all(dir)?;
         let mut c = base.clone();

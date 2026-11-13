@@ -1,15 +1,35 @@
 //! Dense linear algebra kernels (row-major), built on `matrixmultiply` + `rayon`.
 //!
-//! * `sgemm` / `dgemm`   : single-thread strided GEMM (safe to call inside rayon tasks)
-//! * `pgemm_f32/f64`     : multi-thread GEMM (splits C along its larger dimension)
-//! * `cholesky_lower`    : blocked right-looking Cholesky (f64)
-//! * `tri_inverse_lower` : blocked inverse of a lower-triangular matrix (f64)
-//! * `upper_chol_of_inverse` : the factor `U` (upper) with `H^-1 = U^T U` used by GPTQ
-//! * `gram_accumulate`   : `H += X^T Y` over token chunks
+//! This module exists so the quantizer has **no BLAS link dependency** (a portable build on Windows/MSVC,
+//! Linux and macOS with no external library) while still getting close to vendor performance: the inner
+//! kernels come from `matrixmultiply`, which generates blocked SIMD micro-kernels (SSE/AVX/FMA selected at
+//! runtime), and parallelism is added by splitting the output matrix across rayon tasks.
+//!
+//! * [`sgemm`] / [`dgemm`]      : single-thread strided GEMM. Deliberately single-threaded so they are safe
+//!   to call from inside a rayon task (the engine calls them per row chunk) — no nested thread explosion.
+//! * [`pgemm_f32`] / [`pgemm_f64`]: multi-thread GEMM, splitting `C` along its larger dimension so the
+//!   chunks are wide enough to be efficient and disjoint (no synchronisation needed).
+//! * [`cholesky_lower`]         : blocked right-looking Cholesky (f64)
+//! * [`tri_inverse_lower`]      : blocked inverse of a lower-triangular matrix (f64)
+//! * [`upper_chol_of_inverse`]  : the factor `U` (upper) with `H^-1 = U^T U` used by GPTQ
+//! * [`gram_accumulate`]        : `H += X^T Y` over token chunks (Hessian capture/validation)
+//!
+//! All matrices are row-major and every kernel takes explicit row/column strides, because the engine works
+//! on sub-blocks of larger buffers (`U[j*n + j..]`, `H[:, c0..c1]`, transposed views such as `U^T`) without
+//! ever copying them. A transpose is therefore free: it is just `lda = 1` instead of `lda = n`.
+//!
+//! # Safety model
+//!
+//! The raw pointers handed to the kernels must describe valid, non-aliasing strided views (the `C` output
+//! must not overlap `A` or `B`). The wrappers themselves are `unsafe fn` for exactly that reason; callers
+//! in this crate derive them from slice borrows, which keeps disjointness checked by the borrow checker.
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 
+/// Raw mutable pointer wrapper that is `Send`/`Sync`, so a rayon closure can capture it. Rust pointers are
+/// neither by default, and the split-GEMM below hands disjoint regions of one buffer to different tasks —
+/// the disjointness argument lives here, not in the type system.
 #[derive(Clone, Copy)]
 pub struct SPtr<T>(pub *mut T);
 unsafe impl<T> Send for SPtr<T> {}
@@ -21,6 +41,7 @@ impl<T> SPtr<T> {
     }
 }
 
+/// Read-only counterpart of [`SPtr`] (see the note there).
 #[derive(Clone, Copy)]
 pub struct CPtr<T>(pub *const T);
 unsafe impl<T> Send for CPtr<T> {}
@@ -80,6 +101,11 @@ make_gemm!(dgemm, f64, matrixmultiply::dgemm);
 macro_rules! make_pgemm {
     ($name:ident, $t:ty, $base:ident) => {
         /// Multi-threaded `C = alpha * A * B + beta * C` (rayon). Splits along the larger of m/n.
+        ///
+        /// Small problems run single-threaded: below ~2M multiply-accumulates the rayon dispatch cost
+        /// dominates, and many of the engine's GEMMs are exactly that small (per-block lazy updates). The
+        /// split axis is chosen so each task writes a contiguous, disjoint slab of `C`, which is why no
+        /// locking or reduction is needed.
         ///
         /// # Safety
         /// Same contract as the single-thread kernel.
@@ -159,6 +185,18 @@ make_pgemm!(pgemm_f64, f64, dgemm);
 
 /// In-place blocked Cholesky of a symmetric positive-definite `n x n` row-major matrix.
 /// On success the lower triangle holds `L` (`A = L L^T`); the upper triangle is garbage.
+///
+/// Right-looking (LAPACK "right" variant): factor a diagonal block, solve the panel below it, then push the
+/// update into the trailing submatrix as one GEMM per row-chunk. Blocking is what makes this competitive —
+/// the unblocked textbook loop is memory-bound, while steps 2-3 run inside `dgemm`. The panel copy in step 3
+/// exists to break aliasing between the operands and the destination of that GEMM.
+///
+/// Only the *lower* triangle of the trailing update is touched (`cols = i0 + mrows`), because the upper half
+/// is never read back: skipping it halves the arithmetic.
+///
+/// A non-positive or non-finite pivot is a hard error rather than a silent fallback: with calibration
+/// Hessians it means the matrix is singular (too few tokens for `d_in`, or zero damping) and any "repaired"
+/// factor would quietly produce garbage quantization. The message tells the user what to change.
 pub fn cholesky_lower(a: &mut [f64], n: usize) -> Result<()> {
     assert_eq!(a.len(), n * n);
     const NB: usize = 96;
@@ -238,6 +276,11 @@ pub fn cholesky_lower(a: &mut [f64], n: usize) -> Result<()> {
 }
 
 /// Inverse of a lower-triangular matrix (only the lower triangle of `l` is read).
+///
+/// Blocked column-panel formulation: invert a diagonal block explicitly, then fill the panel below it with
+/// two GEMMs (`Y21 = -L22^-1 * L21 * Y11`). Triangular inversion is O(n^3/3) and dominated by those GEMMs, so
+/// blocking matters just as much as in Cholesky. Never reads the strictly upper triangle, which is why the
+/// caller may leave it full of Cholesky garbage.
 pub fn tri_inverse_lower(l: &[f64], n: usize) -> Vec<f64> {
     const NB: usize = 96;
     let mut y = vec![0f64; n * n];
@@ -305,9 +348,17 @@ pub fn tri_inverse_lower(l: &[f64], n: usize) -> Vec<f64> {
 
 /// Returns the upper-triangular `U` (row-major, f32) with `H^-1 = U^T U` (the factor GPTQ uses).
 ///
-/// Uses the flip trick: with `J` the exchange matrix, `J H J = L' L'^T` gives `H = R R^T` for the
-/// upper `R = J L' J`, hence `U = R^-1 = J L'^-1 J`. One Cholesky + one triangular inverse,
-/// instead of Cholesky -> full inverse -> Cholesky.
+/// This is the single most important kernel in the crate: GPTQ's column-by-column compensation *is* the
+/// sequence of Schur-complement updates, and row `j` of `U` is exactly the coefficient vector that update
+/// needs. Forming `H^-1` and then Cholesky-ing it would cost a full inverse (and lose accuracy); instead use
+/// the flip trick: with `J` the exchange matrix, `J H J = L' L'^T` gives `H = R R^T` for the upper
+/// `R = J L' J`, hence `U = R^-1 = J L'^-1 J`. One Cholesky + one triangular inverse.
+///
+/// `h.reverse()` on the flat row-major buffer is the flip: reversing all elements maps element `(i, j)` to
+/// `(n-1-i, n-1-j)`, i.e. conjugates by `J` on both axes — no transpose copy needed. The final scatter undoes
+/// the flip while writing only the upper triangle (`for j in i..n`) and downcasting f64 -> f32; keeping f64 up
+/// to this point is deliberate, since `U_jj` appears as a divisor in the engine's error propagation and its
+/// accuracy directly bounds the reported loss.
 pub fn upper_chol_of_inverse(mut h: Vec<f64>, n: usize) -> Result<Vec<f32>> {
     assert_eq!(h.len(), n * n);
     h.reverse(); // flips both axes of the row-major matrix
@@ -324,6 +375,16 @@ pub fn upper_chol_of_inverse(mut h: Vec<f64>, n: usize) -> Result<Vec<f32>> {
 }
 
 /// `H += X^T Y` where `x`, `y` are `t x n` row-major token matrices (Gram / cross-covariance).
+///
+/// The Hessian is accumulated as a sum over token chunks, each evaluated by one GEMM into an f32 scratch and
+/// then widened into the f64 accumulator. Chunking at 2048 tokens bounds the scratch to `n x n` regardless of
+/// how many calibration tokens the user feeds in, and keeping the *running* sum in f64 avoids the catastrophic
+/// cancellation you would get from accumulating millions of O(1) terms in f32 — that noise is what would make
+/// a Hessian look non-positive-definite.
+///
+/// The transposed read of `X` (`lda = 1`, `ldb = n`) is exactly why the kernels take explicit strides: `X^T Y`
+/// needs no copy of `X`. With `x == y` this computes the symmetric Hessian `X X^T` used by the quantizer; with
+/// different `x`/`y` it computes the asymmetric cross-covariance `M = X X~^T`.
 pub fn gram_accumulate(x: &[f32], y: &[f32], t: usize, n: usize, h: &mut [f64]) {
     assert_eq!(x.len(), t * n);
     assert_eq!(y.len(), t * n);
@@ -361,6 +422,7 @@ mod tests {
     use super::*;
     use crate::rng::Rng;
 
+    /// A random well-conditioned SPD matrix (`M M^T + I`) used by every kernel test here.
     fn rand_spd(n: usize, seed: u64) -> Vec<f64> {
         let mut r = Rng::new(seed);
         let m: Vec<f64> = (0..n * (n + 8)).map(|_| r.normal() as f64).collect();
@@ -380,6 +442,8 @@ mod tests {
         h
     }
 
+    /// Check `L L^T = A` element by element. `n = 150` deliberately crosses the `NB = 96` block boundary so
+    /// the panel solve and the blocked trailing GEMM are exercised, not just the unblocked first block.
     #[test]
     fn cholesky_matches_definition() {
         let n = 150; // crosses the NB=96 block boundary
@@ -399,6 +463,10 @@ mod tests {
         assert!(maxerr < 1e-10, "chol err {maxerr}");
     }
 
+    /// The defining property of the GPTQ factor: `U^T U H = I`. Tolerance is loose (5e-4) because `U` is
+    /// stored as f32 while `H` stays f64 — that rounding, not the algorithm, sets the floor. Also asserts the
+    /// structural contract the engine relies on: strictly lower entries are exactly zero and every diagonal
+    /// entry is positive (it is used as a divisor, so a non-positive one would flip compensation signs).
     #[test]
     fn upper_factor_of_inverse() {
         let n = 200;
@@ -435,6 +503,10 @@ mod tests {
         }
     }
 
+    /// The parallel GEMM must agree with the single-thread one. Two shapes are tested so both split paths run:
+    /// `m >= n` (row split) and `n > m` (column split). Run inside an explicit 4-thread pool because a test
+    /// binary may otherwise be scheduled on a single thread, which would silently make the parallel path a
+    /// pass-through and test nothing.
     #[test]
     fn parallel_gemm_matches_serial() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();

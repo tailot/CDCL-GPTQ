@@ -1,3 +1,10 @@
+//! `cdclq` command line: the only binary in the crate. Three subcommands — `quantize` (the real job), `dequant`
+//! (format round-trip / audit) and `bench` (synthetic A/B of GPTQ vs CDCL).
+//!
+//! The CLI layer holds no algorithm logic: it parses flags into [`Config`] and hands them to the library. Keeping it
+//! that thin is what lets the tests drive `engine` directly without going through argument parsing, and it is why
+//! every flag below maps one-to-one onto a documented field of `Config`.
+
 use anyhow::{bail, Result};
 use cdclq::bench::{self, BenchArgs};
 use cdclq::engine::{Config, Method};
@@ -9,7 +16,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "cdclq", version, about = "CDCL-GPTQ: conflict-driven, Hessian-exact post-training quantizer")]
 struct Cli {
-    /// Worker threads (default: all cores)
+    /// Worker threads (default: all cores).
+    /// Worth exposing because the engine parallelizes over rows and large `--row_chunk` values can oversubscribe
+    /// memory bandwidth; pinning also makes timings reproducible across runs.
     #[arg(long, global = true)]
     threads: Option<usize>,
     #[command(subcommand)]
@@ -28,10 +37,14 @@ enum Cmd {
 
 #[derive(Copy, Clone, ValueEnum)]
 enum MethodArg {
+    /// Plain GPTQ: phase 1 only, no repair. The baseline every gain percentage is measured against.
     Gptq,
+    /// Full CDCL-GPTQ: phase 1 + scale refit + monotone coordinate descent on the worst sub-blocks.
     Cdcl,
 }
 
+/// Tuning flags, shared by `quantize` and `bench` so a benchmark can be run with exactly the flags that will be used for
+/// the real model. This is a flattened argument group rather than duplicated flags, so both subcommands stay in sync.
 #[derive(Args, Clone)]
 struct QArgs {
     /// Code bits for the dense part
@@ -83,6 +96,8 @@ struct QArgs {
 }
 
 impl QArgs {
+    /// Map flags to the library config. `--no-act-order` / `--no-refit-scales` are negated here so the *positive* form is
+    /// the default inside the engine (fewer double-negatives in the algorithm code).
     fn to_cfg(&self) -> Config {
         Config {
             bits: self.bits,
@@ -108,6 +123,8 @@ impl QArgs {
     }
 }
 
+/// Quantize a real checkpoint. Both outputs are on unless explicitly disabled, because the accuracy claim and the size
+/// claim come from the same run: `dequant/` is what an evaluation harness loads, `packed/` is what shows the savings.
 #[derive(Args)]
 struct QuantizeArgs {
     /// Model weight shard(s), .safetensors (F32/F16/BF16)
@@ -134,6 +151,8 @@ struct QuantizeArgs {
     q: QArgs,
 }
 
+/// Format round-trip. Also useful on its own: it turns a packed checkpoint into something any inference stack can load,
+/// which is how the accuracy of a packed model gets measured without writing an inference kernel.
 #[derive(Args)]
 struct DequantArgs {
     #[arg(long)]
@@ -145,14 +164,19 @@ struct DequantArgs {
     dtype: Option<String>,
 }
 
+/// Synthetic layer benchmark. Everything here is generated (correlated activations with outliers, a random weight
+/// matrix), so it measures the *algorithm* rather than one model — and `--dump` writes one of those cases out for
+/// `scripts/ref_gptq_check.py`, which re-derives the loss with PyTorch as an independent implementation.
 #[derive(Args)]
 struct BenchCli {
     #[arg(long, default_value_t = 1024)]
     rows: usize,
     #[arg(long, default_value_t = 2048)]
     cols: usize,
+    /// Calibration tokens (Hessian rank is capped by this, so keep it well above `--cols`)
     #[arg(long, default_value_t = 16384)]
     tokens: usize,
+    /// Tokens used for the held-out test Hessian, which no method has seen during quantization
     #[arg(long, default_value_t = 4096)]
     test_tokens: usize,
     #[arg(long, default_value_t = 1)]
@@ -173,6 +197,8 @@ struct BenchCli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(t) = cli.threads {
+        // Build the global pool before any work: rayon caches it on first use, so setting it after a parallel
+        // section has started would silently leave the default (all cores) in place.
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global()?;
     }
     match cli.cmd {
@@ -200,6 +226,8 @@ fn main() -> Result<()> {
                 rep.total_secs
             );
             if rep.layers.is_empty() {
+                // The most common failure by far: the Hessian file was captured from a different architecture or with
+                // different tensor names, so nothing matched and the "quantized" model is just a copy of the input.
                 bail!("no layer was quantized: check that the Hessian names match '<weight name without .weight>.H'");
             }
         }
