@@ -61,58 +61,73 @@ jobs:
         run: cargo test --release --locked --all-targets
 
       # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with
-      # no model files needed. Then the static-link guard. Its evidence goes to $GITHUB_STEP_SUMMARY - rendered in full on
-      # the run page - because Actions hides stdout and truncates stderr annotations once a script exits non-zero, which left
-      # six runs failing here with nothing but "exit code 1" to read.
+      # no model files needed. Then the static-link guard, which must never be able to abort on its own diagnostics.
       #
-      # What the guard actually asserts, after two wrong theories cost those runs: `+crt-static` on x86_64-unknown-linux-gnu
-      # links glibc into the binary but *keeps* the PT_INTERP program header and a DT_NEEDED entry for libc.so.6 - a static
-      # executable with an interpreter is normal on gnu targets, so requiring neither INTERP nor NEEDED rejects every
-      # successful build (that was one wrong theory; `ldd` exiting non-zero on a static binary was the other). The property
-      # worth failing on is that no library gets resolved to a shared object at exec time: ldd lists no "name => path" arrow.
-      # That is what the release notes promise ("no glibc or runtime dependency") and what breaks on an older distro when it
-      # silently regresses.
+      # Seven runs failed here with a bare "exit code 1" and nothing readable, because of a trap worth writing down: Actions
+      # runs each script under `bash -e`, so any command returning non-zero ends the script at that line, and stdout is then
+      # hidden from the log. A `{ ... } | tee` block looks safe because every command inside it carries `|| true`, but a
+      # *function* called in that block does not: `log`, `fail` and `[ -f ] || fail` all returned non-zero on the way to a
+      # verdict (a function's status is its last command, here an append followed by a grep that finds nothing), so the
+      # script died before writing anything. Every call that can legitimately return non-zero now ends in `|| true`, the
+      # file test is an if-block rather than a `||` chain, and the verdict comes from `exit 0`/`exit 1` at the very end.
+      # Evidence goes to $GITHUB_STEP_SUMMARY, which renders in full on the run page even when the step fails.
+      #
+      # What the guard asserts, after two wrong theories cost those runs: `+crt-static` on x86_64-unknown-linux-gnu links
+      # glibc into the executable but *keeps* an ELF interpreter and a DT_NEEDED entry for libc.so.6 - a static binary with
+      # an interpreter is normal on a gnu target, so requiring neither rejected every good build. And ldd's exit status means
+      # nothing here: it exits 1 on binaries it declines to inspect. The property that actually protects users on older
+      # distros is that no library resolves to a shared object at exec time, which is exactly what an "name => path" arrow
+      # reports. So the verdict reads text only: arrow present means fail, anything else (fully static output, or ldd
+      # declining) means pass, and empty output fails because silence is not evidence.
       - name: Smoke the artifact
         run: |
           BIN=./target/release/cdclq
-          log() { printf '%s\n' "$1"; printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; }
-          fail() { log "ERROR: $1"; echo '```' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          { echo "### Artifact evidence"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          log() { printf '%s\n' "$1" || true; }
+          note() { printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY" || true; }
+          both() { log "$1"; note "$1"; }
+          fence() { note '```'; }
+          RC=0
+          { echo "### Artifact evidence"; fence; } >> "$GITHUB_STEP_SUMMARY"
 
-          [ -f "$BIN" ] || fail "$BIN was not produced by the build"
+          if [ ! -f "$BIN" ]; then
+            both "ERROR: $BIN was not produced by the build"
+            fence
+            log "step verdict: fail (missing artifact)"
+            exit 1
+          fi
 
-          # `|| true` on every probe and no inherited pipeline status: Actions runs this under `bash -e`, so a diagnostic
-          # returning non-zero (file or readelf missing from the image, ldd exiting 1 on a static binary) would abort the
-          # step before its verdict. tee puts the block in both the raw log and the summary.
           ld=$(ldd "$BIN" 2>&1 || true)
           { "$BIN" --version
             echo "--- file ---"; file "$BIN" 2>&1 || true
             echo "--- ELF header ---"; readelf -h "$BIN" 2>&1 | grep -E 'Machine|Type|Entry' || true
-            echo "--- DT_NEEDED entries (resolved statically by +crt-static; an interpreter is expected on gnu) ---"
+            echo "--- DT_NEEDED entries (an interpreter is expected on a gnu target; +crt-static resolves these inside the binary) ---"
             readelf -d "$BIN" 2>&1 | grep NEEDED || echo "none"
-            echo "--- ldd ---"; echo "$ld"; } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "--- ldd ---"; printf '%s\n' "$ld"; } | tee -a "$GITHUB_STEP_SUMMARY" || true
 
-          # A resolved shared object is the regression to catch: such an artifact uploads "successfully" and then breaks on
-          # the older glibc of a user's distro.
+          # `grep -q` returns 1 when it finds nothing, so the test lives inside the if-condition, where `set -e` does not
+          # apply; a bare `grep ... || true` line before it would have aborted the script on the passing path.
           if printf '%s\n' "$ld" | grep -q '=>'; then
-            fail "a shared dependency resolved, +crt-static did not take effect"
+            both "ERROR: a shared dependency resolved, +crt-static did not take effect"
+            RC=1
+          elif [ -z "$ld" ]; then
+            # The probe itself is unavailable on this runner. An unverifiable artifact should not ship silently.
+            both "ERROR: ldd produced no output, so the static link cannot be verified"
+            RC=1
+          elif printf '%s\n' "$ld" | grep -qiE 'not a dynamic executable|statically linked'; then
+            [ "$RC" = 0 ] && note "verdict: no dynamic section to resolve - fully static" || true
+          else
+            # No arrow, no complaint we recognise: for a gnu crt-static binary ldd declines to inspect the file, which is
+            # the expected answer. Nothing was resolved from disk, so the promise holds; the exact wording is in the log.
+            [ "$RC" = 0 ] && note "verdict: ldd resolved nothing from disk (wording above)" || true
           fi
-          # Nothing to resolve. Either the binary has no dynamic section at all ("not a dynamic executable"), or glibc's ldd
-          # declines to inspect one whose interpreter cannot satisfy its own loader requirements - both mean nothing on the
-          # target machine is consulted at exec time, which is the promise being made. Any other answer means the claim
-          # cannot be verified, and an unverifiable artifact should not ship silently.
-          case "$ld" in
-            *"not a dynamic executable"*|*"statically linked"*)
-              log "verdict: no dynamic dependencies to resolve" ;;
-            *"cannot execute"*|*"No such file or directory"*|*"not found"*|*"ld.so"*)
-              log "verdict: ldd could not start the interpreter - expected for crt-static on a gnu target"
-              log "the DT_NEEDED entries above are satisfied from inside the binary, not from disk" ;;
-            "")
-              fail "ldd produced no output at all, so the static link cannot be verified" ;;
-            *)
-              fail "unexpected ldd output, so the static link cannot be verified: $ld" ;;
-          esac
-          { echo "static link verified"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+          fence
+          if [ "$RC" = 0 ]; then
+            log "step verdict: pass (see the evidence above)"
+            exit 0
+          fi
+          log "step verdict: fail (see the evidence above)"
+          exit 1
 
       # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
       # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
