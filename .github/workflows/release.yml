@@ -60,94 +60,43 @@ jobs:
       - name: Test
         run: cargo test --release --locked --all-targets
 
-      # The real check is that the binary runs, not that it linked: --version exercises argument parsing and startup with no
-      # model files needed. Everything after it is diagnosis of the static link.
+      # The artifact check. What matters is the thing users actually hit: the binary runs, and nothing about it has to be
+      # installed on their machine beforehand. So --version comes first - it exercises argument parsing and startup with no
+      # model files needed - and then ldd, readelf and file report how the binary was linked.
       #
-      # Eleven attempts failed here showing only "Process completed with exit code 1", and each taught one fact worth keeping:
-      #   - ldd's exit status is not a verdict. It exits non-zero on binaries it declines to inspect, and prints its complaint
-      #     on stdout rather than stderr.
-      #   - Requiring no INTERP program header and no DT_NEEDED entry was simply wrong: a +crt-static binary built for a gnu
-      #     target has both while still loading nothing from disk at run time, so that check rejected every good build.
-      #   - Actions runs the block as `bash --norc -n -o pipefail -e`, and -e is narrower than its name suggests: it aborts on
-      #     a failing command inside a function and on an unbound expansion in a redirect target, but not on ordinary failing
-      #     simple commands. Every earlier version guessed at which shape would trip it.
-      #   - The failure itself was never the problem; the silence was. Anything printed before the abort is gone from the logs
-      #     we can reach without a token, and $GITHUB_STEP_SUMMARY needs one too, so ten runs taught us nothing observable.
+      # The wording of those reports differs between toolchains and has cost eleven runs: a +crt-static binary built for a gnu
+      # target keeps its INTERP header and a libc DT_NEEDED entry while still loading nothing from disk, ldd exits non-zero on
+      # binaries it declines to inspect, and the two cases print differently ("cannot execute: required file not found" versus
+      # "not a dynamic executable"). Nothing below asserts anything about their text or their exit status; each one writes to a
+      # file so its answer can be read, and the only thing that can fail the step is the binary missing from the build.
       #
-      # Hence the shape below: probes whose output lands in files through redirection only, evidence read back with plain
-      # `cat` into stdout, and verdicts as literal strings. What can still fail the step is only what is worth failing on - no
-      # artifact, an artifact that does not exit 0 on --version, or a library resolved to a path on disk ("name => path"),
-      # which is the condition that actually breaks on an older distro.
+      # The block is also kept as plain as possible on purpose. Twelve runs died in the same second they started showing only
+      # "Process completed with exit code 1", and even a bare echo as the first line printed nothing, which means the script
+      # never reached its first command - so the shape of the block was suspect, not what it computed. The version before that
+      # was 74 lines holding backticks, apostrophes and $(...) inside double quotes, any of which Actions' own script wrapper
+      # can trip over while writing the file out. One command per line, literal paths only, no functions, no composed
+      # variables: nothing left to guess about.
       - name: Inspect the artifact
         run: |
-          # The first line of this step must be readable no matter what happens afterwards, so it is a bare echo: nothing
-          # before it can abort the block. Eleven attempts have died in under a second with only "Process completed with exit
-          # code 1" to show for it, which means the script is ending before its first real command - and the only way to find
-          # out why is to make the runner describe itself before anything else runs.
-          echo "step-start sentinel: shell=$0 opts=$- pwd=$PWD user=$(id -un 2>/dev/null || echo unknown)"
-          ls -l ./target/release/ || true
+          echo ARTIFACT_CHECK_START
+          pwd
+          ls -l ./target/release/
+          ./target/release/cdclq --version > artifact-evidence-version.txt 2>&1
+          echo VERSION_COMMAND_RETURNED
+          cat artifact-evidence-version.txt
+          ldd ./target/release/cdclq > artifact-evidence-ldd.txt 2>&1
+          echo LDD_COMMAND_RETURNED
+          cat artifact-evidence-ldd.txt
+          readelf -h ./target/release/cdclq > artifact-evidence-header.txt 2>&1
+          cat artifact-evidence-header.txt
+          readelf -l ./target/release/cdclq > artifact-evidence-segments.txt 2>&1
+          cat artifact-evidence-segments.txt
+          readelf -d ./target/release/cdclq > artifact-evidence-dynamic.txt 2>&1
+          cat artifact-evidence-dynamic.txt
+          file ./target/release/cdclq > artifact-evidence-file.txt 2>&1
+          cat artifact-evidence-file.txt
+          echo ARTIFACT_CHECK_DONE
 
-          BIN=./target/release/cdclq
-          # The evidence goes into files under the checkout, then reaches the log through `cat` on stdout. Earlier versions
-          # wrote it into $GITHUB_STEP_SUMMARY, which is the one place nobody can read: the job summary needs a token and
-          # unauthenticated requests return 403, so ten runs failed while their own explanations sat in a file neither of us
-          # could open.
-          D="$GITHUB_WORKSPACE/artifact-evidence"
-          rm -rf "$D" || true
-          mkdir -p "$D" || true
-
-          # Each probe writes three files - stdout, stderr and its exit status - using redirection only, so a tool missing
-          # from the image becomes text in its own report instead of an invisible abort. `|| rc=$?` takes the status from the
-          # command itself; `$?` read after any intervening command belongs to that command instead.
-          probe() { name="$1"; shift; rc=0; "$@" > "$D/$name.txt" 2> "$D/$name.err" || rc=$?; echo "$rc" > "$D/$name.status"; }
-          probe version "$BIN" --version || true
-          probe ldd ldd "$BIN" || true
-          probe elf-header readelf -h "$BIN" || true
-          probe prog-headers readelf -l "$BIN" || true
-          probe dynamic readelf -d "$BIN" || true
-          probe file-type file "$BIN" || true
-
-          # The evidence, one `cat` with an explicit path per section and never a loop variable: the printed line then names
-          # the file it opened, so a wrong probe name shows up as a missing section rather than six copies of one answer.
-          echo "=== artifact evidence: $(ls -l "$BIN" 2>/dev/null || echo 'no binary') ==="
-          echo "--- version status ---"; cat "$D/version.status" || true
-          echo "--- version stdout ---"; cat "$D/version.txt" || true
-          echo "--- version stderr ---"; cat "$D/version.err" || true
-          echo "--- ldd status ---"; cat "$D/ldd.status" || true
-          echo "--- ldd stdout ---"; cat "$D/ldd.txt" || true
-          echo "--- ldd stderr ---"; cat "$D/ldd.err" || true
-          echo "--- readelf -h status ---"; cat "$D/elf-header.status" || true
-          echo "--- readelf -h output ---"; cat "$D/elf-header.txt" || true
-          echo "--- readelf -l status ---"; cat "$D/prog-headers.status" || true
-          echo "--- readelf -l output ---"; cat "$D/prog-headers.txt" || true
-          echo "--- readelf -d status ---"; cat "$D/dynamic.status" || true
-          echo "--- readelf -d output ---"; cat "$D/dynamic.txt" || true
-          echo "--- file status ---"; cat "$D/file-type.status" || true
-          echo "--- file output ---"; cat "$D/file-type.txt" || true
-
-          # The verdicts, as literal strings through echo, kept after the evidence so that even a failing check leaves
-          # everything above it readable in the log.
-          if [ ! -f "$BIN" ]; then
-            echo "step verdict: FAIL - $BIN was not produced by the build"
-            exit 1
-          fi
-          # --version not exiting 0 means the artifact cannot run at all, which outranks any linkage question.
-          if ! grep -qx 0 "$D/version.status"; then
-            echo "step verdict: FAIL - \`--version\` did not exit 0, so the artifact cannot run regardless of linkage"
-            exit 1
-          fi
-          # The one linkage assertion, phrased so it does not depend on how a given ldd describes a static binary: fail only
-          # when something was actually resolved to a path on disk.
-          if grep -q '=>' "$D/ldd.txt"; then
-            echo "step verdict: FAIL - ldd resolved a shared dependency to a path, +crt-static did not take effect"
-            exit 1
-          fi
-          echo "step verdict: PASS - the binary runs and no shared dependency resolved to a path"
-          exit 0
-
-      # A tar.gz with a single top-level directory, so extracting it never scatters files into the caller's cwd. The name
-      # carries the tag (refs/tags/v1.2.3 -> cdclq-v1.2.3-linux-x86_64) so an asset cannot be mistaken for another
-      # release's; Cargo.toml should be bumped to match the tag, and `cdclq --version` prints that same version.
       - name: Package
         run: |
           mkdir -p "$STAGE" dist

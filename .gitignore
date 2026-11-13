@@ -17,6 +17,6 @@ __pycache__/
 # alla GitHub Release; un commit da 8,6 MB non è versionabile e diventa obsoleto al primo rebuild
 /dist/
 
-# Output of the release workflow's artifact check: it writes its probe reports next to the checkout so they can be read back
-# with plain `cat` into the job log. Local runs of that step leave the same directory behind.
-/artifact-evidence/
+# Output of the release workflow's artifact check: it writes its probe reports at the top of the checkout so they can be read
+# back with plain `cat` into the job log. Local runs of that step leave the same files behind.
+/artifact-evidence-*.txt
