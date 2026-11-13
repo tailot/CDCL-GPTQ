@@ -80,30 +80,25 @@ jobs:
       # which is the condition that actually breaks on an older distro.
       - name: Inspect the artifact
         run: |
+          # The first line of this step must be readable no matter what happens afterwards, so it is a bare echo: nothing
+          # before it can abort the block. Eleven attempts have died in under a second with only "Process completed with exit
+          # code 1" to show for it, which means the script is ending before its first real command - and the only way to find
+          # out why is to make the runner describe itself before anything else runs.
+          echo "step-start sentinel: shell=$0 opts=$- pwd=$PWD user=$(id -un 2>/dev/null || echo unknown)"
+          ls -l ./target/release/ || true
+
           BIN=./target/release/cdclq
-          # The evidence goes into files under the repository directory, then travels to the log through `cat`. Earlier
-          # versions wrote it into $GITHUB_STEP_SUMMARY, which is the one place nobody can read: the job summary needs a
-          # token, and unauthenticated requests for it return 403. Ten runs therefore failed while their own explanations sat
-          # in a file neither of us could open. stdout is the log, so that is where everything goes now.
-          #
-          # GITHUB_WORKSPACE replaces RUNNER_TEMP for the same reason: an expansion of an unset variable inside a *redirect
-          # target* aborts the script before anything runs, and $GITHUB_STEP_SUMMARY was exactly such a target in the version
-          # that died silently at its first probe. Here the only expansions sit in arguments of commands that cannot abort the
-          # block, and every file lands in a directory this step creates itself.
+          # The evidence goes into files under the checkout, then reaches the log through `cat` on stdout. Earlier versions
+          # wrote it into $GITHUB_STEP_SUMMARY, which is the one place nobody can read: the job summary needs a token and
+          # unauthenticated requests return 403, so ten runs failed while their own explanations sat in a file neither of us
+          # could open.
           D="$GITHUB_WORKSPACE/artifact-evidence"
           rm -rf "$D" || true
           mkdir -p "$D" || true
 
-          # Each probe writes three files - stdout, stderr and its exit status - using redirection only. Redirection never
-          # changes an exit status, so a tool missing from the image becomes text in its own report instead of an invisible
-          # abort, and no result has to travel back through a command substitution.
-          #
-          # Two traps, both hit by earlier attempts and both reproduced on bash 5.2:
-          # (a) under Actions' `bash -e` a failing command inside a *function* aborts the whole script, so every call site
-          #     needs `|| true` - that is what ended three consecutive runs at their first probe with nothing printed;
-          # (b) `$?` read after any intervening command reports *that* command's status. Guarding the tool with `|| true`
-          #     inside the function made every recorded status 0 and turned a binary dying on --version into a PASS, so the
-          #     status is taken by `|| rc=$?`, which belongs to the command itself.
+          # Each probe writes three files - stdout, stderr and its exit status - using redirection only, so a tool missing
+          # from the image becomes text in its own report instead of an invisible abort. `|| rc=$?` takes the status from the
+          # command itself; `$?` read after any intervening command belongs to that command instead.
           probe() { name="$1"; shift; rc=0; "$@" > "$D/$name.txt" 2> "$D/$name.err" || rc=$?; echo "$rc" > "$D/$name.status"; }
           probe version "$BIN" --version || true
           probe ldd ldd "$BIN" || true
