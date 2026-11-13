@@ -1,4 +1,4 @@
-# cdclq — CDCL-GPTQ
+# CDCL-GPTQ
 A weight-only *post-training quantizer* for LLMs (safetensors → grouped INT2–INT8), written in Rust.
 It starts from GPTQ (exact Cholesky factorisation, blocked lazy updates) and then **repairs the
 conflicts**: it exploits the exact decomposition of the proxy loss to locate the worst sub-blocks and
