@@ -71,12 +71,13 @@ with Rust ≥ 1.75.
 
 ```bash
 cargo build --release          # binary: target/release/cdclq (Windows: target\release\cdclq.exe)
-cargo test --release           # 9 tests
+cargo test --release           # 9 unit tests + 7 end-to-end tests (see "Test suite")
 ```
 
-On PowerShell, with local-CPU codegen (optional): `$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release`.
-A prebuilt Linux x86_64 binary is in `dist/linux-x86_64/cdclq`. The GEMM kernels use AVX/FMA selected
-at runtime.
+On PowerShell, with local-CPU codegen (optional): `$env:RUSTFLAGS="-C target-cpu=native"; cargo build
+--release`. The GEMM kernels use AVX/FMA selected at runtime. Release assets for Linux x86_64 are
+attached to each `v*` tag on GitHub; the binary there is statically linked and built for
+`x86-64-v3`, so it runs on any x86-64 machine with AVX2.
 
 ## Usage
 
@@ -119,6 +120,10 @@ calibration on WikiText-2 **train** (128 × 2048 tokens), evaluation on WikiText
 (334,521 tokens in non-overlapping chunks of 1024) using the fake-quant weights from `out/dequant`.
 `--group 128 --damp 0.01`, act-order on; GPTQ and CDCL otherwise identical. Full protocol, generated
 text samples and reproduction commands: `runs/RESULTS-tinyllama.md`.
+
+The checkpoint itself is **not in this repository** — it is a 6.3 GB download (weights included) that
+CI never needs, since the test suite runs on tiny-random models. To reproduce these numbers, fetch it
+first: `huggingface-cli download TinyLlama/TinyLlama_v1.1 --local-dir models/TinyLlama-1.1B`.
 
 | configuration | bits/weight | model (MB) | vs fp16 | time (s) | proxy-loss gain | perplexity | vs fp16 | top-1 % | vs GPTQ |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -234,7 +239,8 @@ Reproduction: `cdclq bench --rows 512 --cols 2048 --tokens 16384 --test-tokens 4
 - 9 unit tests: blocked Cholesky, `UᵀU·H = I`, parallel GEMM == serial GEMM, mixed bit-width
   pack/unpack, exactness of the loss decomposition, monotonicity + exact bookkeeping of the repair,
   skeleton/act-order permutation, asymmetric case `M = H ⇒ W* = W`.
-- 7 end-to-end tests over three real tiny-random checkpoints — see [Test suite](#test-suite).
+- 7 end-to-end tests over three real tiny-random checkpoints — see [Test suite](#test-suite); both groups
+  run on every push in CI.
 - Cross-check against an independent float64 numpy GPTQ: **identical codes (100%)**, relative loss
   difference 0.
 - End-to-end CLI test on a toy model (q/k/v aliases, 1-D tensors and embeddings passed through):
@@ -283,9 +289,28 @@ checkpoints and regenerate the fixtures:
 python scripts/make_fixtures.py     # downloads the three checkpoints and rewrites tests/fixtures/
 ```
 
+### Continuous integration
+
+`.github/workflows/test.yml` runs the suite on `ubuntu-22.04` for every push to `main` and every pull
+request, pinned to Rust 1.100 with `--locked` (the same toolchain `release.yml` ships, so a green test
+run and the published binary are built against one dependency graph). The workflow fetches the three
+tiny-random checkpoints from Hugging Face — weight tensors only, no tokenizer files — because they are
+not in git.
+
+A green `cargo test` alone would not prove much here: every end-to-end test *skips with a message* when
+its checkpoint or fixture is missing, so a broken path leaves the job green while validating nothing but
+the unit tests. The workflow therefore counts what the suite prints. Each check emits one labelled line
+(`OK roundtrip <model>: …`, `PASS filters <model>: …`), and the job fails unless it sees exactly 19 of
+them — 6 checks over all three models plus the bit-width sweep, which runs on one model only — and zero
+`SKIP` lines. It also asserts that no scratch was left under `target/cdclq-test/`, which is how a test
+that bailed out early would show up. The full log, including the engine's per-layer loss table, is
+uploaded as the `test-log` artifact.
+
 ## Known limitations (please read)
 
 - **One real model measured** (TinyLlama-1.1B, 1.1 B); the procedure is in `runs/RESULTS-tinyllama.md`.
+  The checkpoint is not in this repository — fetch it with `huggingface-cli download
+  TinyLlama/TinyLlama_v1.1 --local-dir models/TinyLlama-1.1B` to rerun those measurements.
   Not measured: 7 B+ models, other families (Mistral/Qwen), downstream benchmarks (lm-eval), and the
   sequential pipeline with quantized inputs. On TinyLlama the gains are real (−9% … −17% at 3 bits) but
   **negligible at 4 bits**; do not use the synthetic numbers as a prediction at high bit-widths.
@@ -317,4 +342,5 @@ tests/           toy_models.rs (end-to-end) + fixtures/<model>/hess.safetensors 
 scripts/         capture_hessians.py, ref_gptq_check.py, eval_ppl.py, gen_compare.py, summarize.py,
                  gen_toy_hessians.py, make_fixtures.py, run_matrix.ps1
 runs/            RESULTS-tinyllama.md = protocol, full table, generated text, reproduction commands
+                 (models/ holds the local checkpoints and is git-ignored)
 ```

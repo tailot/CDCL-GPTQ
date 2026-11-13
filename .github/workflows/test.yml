@@ -1,0 +1,185 @@
+name: test
+
+# On every push to main and every pull request. The release workflow also runs `cargo test`, but only on a tag — by then a
+# regression is already merged. This job is what keeps main honest, and it is cheap enough to run on every commit: the unit
+# tests take milliseconds, the end-to-end suite over the three tiny-random checkpoints about two seconds.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # No RUSTFLAGS here, unlike release.yml: that workflow pins x86-64-v3 and crt-static because it is shipping an artifact.
+  # This job wants the runner's default codegen, so a CPU-feature or link failure shows up as itself instead of as a side
+  # effect of the release flags.
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the toolchain and the lockfile
+        run: |
+          rustup --version
+          cargo --version
+          test -f Cargo.lock || { echo "Cargo.lock missing: CI must resolve exactly the dependency graph that was reviewed" >&2; exit 1; }
+
+      # Same pin as release.yml, so a suite that passes here and a binary built there are reproducible against one
+      # toolchain. If the two diverged, tests could pass on CI while the shipped build fails to compile.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.100'
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The toy tests read `tests/fixtures/<model>/hess.safetensors` and skip with a message when a fixture is missing, so
+      # a broken path would otherwise turn the job green while validating nothing but the unit tests. This fails loudly on
+      # a missing fixture instead; regenerate them with scripts/make_fixtures.py (needs Python + huggingface-hub).
+      - name: Check the test fixtures are present
+        run: |
+          status=0
+          for f in tiny-random-Llama-3 llama-3 tiny-random-llama2; do
+            if [ -f "tests/fixtures/$f/hess.safetensors" ]; then
+              ls -l "tests/fixtures/$f/hess.safetensors"
+            else
+              echo "missing tests/fixtures/$f/hess.safetensors" >&2
+              status=1
+            fi
+          done
+          if [ "$status" = 1 ]; then
+            echo "the Hessians are committed on purpose (3.5 MB): without them the end-to-end suite silently skips" >&2
+            exit 1
+          fi
+
+      # The checkpoints under models/ are deliberately not in git: they total ~80 MB and every one of them is reproducible
+      # from Hugging Face, unlike the synthetic Hessians above (which *are* committed, because regenerating them needs a
+      # Python environment). This step re-fetches exactly the three tiny-random checkpoints the suite reads, keeping only
+      # model.safetensors + config.json + generation_config.json — the tokenizer files are 9-17 MB each and this crate
+      # never opens them, it quantizes weight tensors. The cache stays inside the workspace (.cache/huggingface): actions
+      # deliberately run steps with a temporary HOME, so a default ~/.cache would be recreated on every job anyway.
+      - name: Fetch the tiny-random checkpoints the suite runs on
+        env:
+          HF_HUB_DISABLE_SYMLINKS_WARNING: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          pip install -q 'huggingface-hub>=0.23'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+
+          # Same list as scripts/make_fixtures.py; keep the two in sync. The local directory names are what
+          # tests/toy_models.rs looks for under models/, so they are not free choices.
+          ids = ["llamafactory/tiny-random-Llama-3", "tiny-random/llama-3", "Intel/tiny-random-llama2"]
+          for rid in ids:
+              dst = snapshot_download(
+                  rid,
+                  local_dir=f"models/{rid.split('/')[-1]}",
+                  allow_patterns=["*.safetensors", "config.json", "generation_config.json"],
+              )
+              print("fetched:", dst)
+          PY
+          # Fail here rather than letting the suite skip: `inputs()` returns None when model.safetensors is missing, and a
+          # silently skipped test would otherwise be counted as green by cargo. The counting step catches it too, but this
+          # message names the actual cause.
+          for f in tiny-random-Llama-3 llama-3 tiny-random-llama2; do
+            if [ ! -f "models/$f/model.safetensors" ]; then
+              echo "missing models/$f/model.safetensors after download" >&2
+              ls -l "models/$f" 2>/dev/null >&2
+              exit 1
+            fi
+          done
+          du -sh models
+
+      # --locked so a lockfile that drifted from Cargo.toml fails loudly rather than resolving something new and passing.
+      - name: Build
+        run: cargo build --release --locked
+
+      # Unit tests plus the end-to-end suite (tests/toy_models.rs). The checkpoints under models/ are git-ignored but were
+      # fetched above, and the fixtures are committed, so on CI these tests really run — which the next steps then prove.
+      # `--nocapture` is load-bearing, not a verbosity preference: cargo captures a test thread's *stdout* and replays it as
+      # one block when that test finishes, but eprintln! goes to stderr, which libtest does not capture. So in the default
+      # mode the OK/PASS lines the suite writes — the only evidence that an end-to-end check did more than return Ok — never
+      # reach the log at all (measured: 0 markers with --nocapture off, 19 with it on). A green `test result: ok` therefore
+      # says nothing about coverage, which is exactly what the counting step below needs to prove.
+      #
+      # `--test-threads=1` keeps those markers attributable: libtest prints "test <name> ... " before a test starts and
+      # appends "ok" when it ends, and with concurrent threads the two get split across lines, so a marker can end up glued
+      # to another test's prefix. Serial threads put each block in source order and every marker lands at column 0. The cost
+      # is negligible — the whole suite is ~12 s of wall clock, and the unit tests are milliseconds.
+      #
+      # `script -qec` hands cargo a pty: output then lands in one stream inside test.log and nothing is lost to pipe
+      # buffering; without it, stderr (where the suite reports SKIP/OK) and stdout can be interleaved differently by the
+      # time they reach a file.
+      - name: Test
+        run: script -qec 'cargo test --release --locked -- --nocapture --test-threads=1' test.log
+
+      # A green exit code does not imply coverage: if a path broke, every toy test skips and prints SKIP, and the job would
+      # still be green. Counting those lines turns "the suite passed" into "the end-to-end suite actually ran". The patterns
+      # are anchored at the start of the line because that is how the suite emits them (eprintln! at column 0) — without the
+      # anchor, a test name containing "skip" would look like a skipped check and fail a passing run. That is not hypothetical
+      # here: `filters_and_unmatched_hessians` prints "PASS filters ... --only and --skip honoured", so the SKIP pattern must
+      # be case-sensitive (`grep -c '^SKIP'`, not `grep -ci`) or this step would reject its own passing run.
+      - name: Require the end-to-end tests to have run
+        run: |
+          if [ "$(grep -c '^SKIP' test.log)" -ne 0 ]; then
+            echo "the end-to-end suite skipped checks, so only the unit tests were validated:" >&2
+            grep '^SKIP' test.log >&2
+            exit 1
+          fi
+          # Each OK/PASS line names its check ("OK roundtrip ...", "PASS filters ..."), so the tally below is per check
+          # rather than just a total: 6 checks over all three models, plus the bit-width sweep that runs on one model only,
+          # = 19. Anything else means a test returned before its assertions instead of failing them — which cargo's green
+          # "test result: ok" hides either way. The loop prints each check separately so a regression in one of them is
+          # visible without diffing the log by hand.
+          #
+          # The count is unanchored and every pattern also carries the check name, because with --nocapture libtest writes
+          # "test <name> ... " *before* starting a test and only appends its status when it ends: the first marker a test
+          # prints therefore lands on that same line ("test gptq_and_cdcl_agree_on_phase_one_of_real_checkpoints ... OK
+          # phase1 llamafactory/..."), so an anchored '^(OK|PASS) ' silently loses one line per toy test — measured 18 of
+          # 19 with the anchor, and 12 of 19 if every check were counted that way. Requiring the label after OK/PASS is what
+          # keeps the count honest: a bare "ok" status line or an engine table row cannot match it, whereas anchoring at
+          # column 0 buys nothing once the label is fixed.
+          n=$(grep -cE '(^| )((OK|PASS) (roundtrip|phase1|skeleton|filters|dtypes|dtype-override|bit-widths) )' test.log)
+          echo "end-to-end checks passed: $n"
+          for c in roundtrip phase1 skeleton filters dtypes dtype-override bit-widths; do
+            printf '%-14s %s\n' "$c:" "$(grep -cE "(^| )(OK|PASS) $c " test.log)"
+          done
+          if [ "$n" -ne 19 ]; then
+            echo "expected the toy suite to report exactly 19 OK/PASS lines, got $n" >&2
+            grep -E '(OK|PASS) (roundtrip|phase1|skeleton|filters|dtypes|dtype-override|bit-widths) ' test.log >&2
+            exit 1
+          fi
+
+      # The engine's per-layer table ("[ 12/14 ] model.layers.1.mlp.up_proj [64x8] loss ... -> ... (-33.2%)") is what makes
+      # the numbers above checkable by eye, and --nocapture already puts it in test.log; this step only counts it, so a run
+      # where the pipeline quantized far fewer layers than expected is visible without opening the log. The pattern allows
+      # leading spaces because libtest prefixes each line while it streams a test's output. `|| true` on the grep keeps a
+      # zero count from failing the job: grep -c exits 1 when nothing matched, and the marker counting above is the step
+      # that decides pass/fail.
+      - name: Count the per-layer lines in the run
+        if: always()
+        run: grep -cE ' *\[[ 0-9]+/[ 0-9]+\] ' test.log || true
+
+      - name: Upload the test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
+          retention-days: 14
+
+      # The suite writes its scratch under target/cdclq-test/ and removes it at the end of each test, so anything left
+      # there means a test bailed out early. Cheap guard against a swallowed failure. `|| true` on the ls keeps the
+      # substitution non-empty-safe when the directory does not exist: bash would otherwise trip on the failed command.
+      - name: Check no scratch was left behind
+        run: |
+          if [ -n "$(ls -A target/cdclq-test 2>/dev/null || true)" ]; then
+            echo "tests left files in target/cdclq-test:" >&2
+            ls -lR target/cdclq-test >&2
+            exit 1
+          fi

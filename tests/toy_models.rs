@@ -143,8 +143,12 @@ fn assert_identical(a: &Snapshot, b: &Snapshot, name: &str) -> Result<()> {
 
 /// Scratch output directory for one test of one model, cleared first so repeated runs never compare against stale files
 /// and nothing is ever written into the source tree.
-fn fresh_dir(name: &str) -> Result<PathBuf> {
-    let out = repo_root().join("target").join("cdclq-test").join(name);
+///
+/// `tag` has to be unique per *test*, not just per model: cargo runs the seven tests in this file on separate threads, and
+/// two tests that shared a directory would delete each other's outputs mid-assertion (the round-trip test reads `packed/`
+/// long after writing it). Every call site passes its own suffix.
+fn fresh_dir(tag: &str) -> Result<PathBuf> {
+    let out = repo_root().join("target").join("cdclq-test").join(tag);
     if out.exists() {
         std::fs::remove_dir_all(&out)?;
     }
@@ -249,7 +253,7 @@ fn toy_checkpoint_quantize_and_roundtrip() -> Result<()> {
                 continue;
             }
         };
-        let out = fresh_dir(m.dir)?;
+        let out = fresh_dir(&format!("{}-roundtrip", m.dir))?;
         let c = cfg(m);
         let rep = pipeline::quantize_model(&QuantOpts {
             weights: vec![w.clone()],
@@ -424,7 +428,7 @@ fn toy_checkpoint_quantize_and_roundtrip() -> Result<()> {
             bail!("{}: packed qweights are only {:.2}x smaller than the original weights", m.id, orig_bytes as f64 / qw_bytes as f64);
         }
         eprintln!(
-            "OK {}: {} layers quantized, {} copied through, mean bpw {:.2}, repair gain {:+.2}%, qweight {:.1}x smaller",
+            "OK roundtrip {}: {} layers quantized, {} copied through, mean bpw {:.2}, repair gain {:+.2}%, qweight {:.1}x smaller",
             m.id,
             rep.layers.len(),
             untouched,
@@ -596,7 +600,7 @@ fn gptq_and_cdcl_agree_on_phase_one_of_real_checkpoints() -> Result<()> {
         if improved == 0 {
             bail!("{}: the repair improved none of the {checked} layers — phase 2 is untested on this model", m.id);
         }
-        eprintln!("OK {}: phase-1 equality on {checked} layers, repair improved {improved}", m.id);
+        eprintln!("OK phase1 {}: {checked} layers bit-identical GPTQ vs CDCL, repair improved {improved}", m.id);
     }
     Ok(())
 }
@@ -750,7 +754,7 @@ fn act_order_and_skeleton_survive_packing() -> Result<()> {
         if out.join("dequant").exists() {
             bail!("{}: --no-dequant still wrote a dequant/ directory", m.id);
         }
-        eprintln!("OK {}: act-order + skeleton packed on {promoted}/{} layers", m.id, rep.layers.len());
+        eprintln!("OK skeleton {}: act-order + skeleton packed on {promoted}/{} layers", m.id, rep.layers.len());
         std::fs::remove_dir_all(&out)?;
     }
     Ok(())
@@ -884,7 +888,7 @@ fn filters_and_unmatched_hessians() -> Result<()> {
                 }
             }
         }
-        eprintln!("OK {}: --only/--skip honoured; unmatched and mismatched Hessians rejected", m.id);
+        eprintln!("PASS filters {}: --only and --skip honoured; unmatched and mismatched Hessians rejected", m.id);
         std::fs::remove_dir_all(&out)?;
     }
     Ok(())
@@ -942,7 +946,7 @@ fn dtypes_are_preserved_and_widening_is_lossless() -> Result<()> {
                 bail!("{}: fake-quant output changed {name} from {dt:?} to {:?}", m.id, deq.tensors[name].0);
             }
         }
-        eprintln!("OK {}: dtype {want:?} preserved, widening lossless over {} tensors", m.id, orig.tensors.len());
+        eprintln!("OK dtypes {}: {want:?} preserved, widening lossless over {} tensors", m.id, orig.tensors.len());
         std::fs::remove_dir_all(&out)?;
     }
     Ok(())
@@ -1018,7 +1022,7 @@ fn dequant_dtype_override() -> Result<()> {
                 bail!("{}: pass-through tensor {name} changed dtype under --dtype", m.id);
             }
         }
-        eprintln!("OK {}: dtype override works (native {:?}, {} quantized layers)", m.id, native_dt, quantized.len());
+        eprintln!("OK dtype-override {}: works (native {:?}, {} quantized layers)", m.id, native_dt, quantized.len());
         std::fs::remove_dir_all(&out)?;
     }
     Ok(())
@@ -1091,6 +1095,6 @@ fn all_bit_widths_pack_consistently() -> Result<()> {
         }
         std::fs::remove_dir_all(&out)?;
     }
-    eprintln!("OK {}: bits 2..=8 pack consistently and bpw is measured, not nominal", m.id);
+    eprintln!("OK bit-widths {}: bits 2..=8 pack consistently and bpw is measured, not nominal", m.id);
     Ok(())
 }
