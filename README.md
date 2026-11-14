@@ -305,7 +305,7 @@ them — 6 checks over all three models plus the bit-width sweep, which runs on 
 that bailed out early would show up. The full log, including the engine's per-layer loss table, is
 uploaded as the `test-log` artifact.
 
-## Known limitations (please read)
+## Known limitations
 
 - **One real model measured** (TinyLlama-1.1B, 1.1 B); the procedure is in `runs/RESULTS-tinyllama.md`.
   The checkpoint is not in this repository — fetch it with `huggingface-cli download
