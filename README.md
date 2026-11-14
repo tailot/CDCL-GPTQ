@@ -84,6 +84,10 @@ attached to each `v*` tag on GitHub; the binary there is statically linked and b
 # 1) calibration Hessians (PyTorch + transformers; see the docstring for memory and --only)
 python scripts/capture_hessians.py --model ./model --text calib.txt --out hess.safetensors \
        --nsamples 128 --seqlen 2048 [--struct-chars "(){}=<>" --struct-weight 4]
+#    What costs GPU memory is the fp32 accumulator: d_in^2 * 4 bytes per *distinct layer input*
+#    (21 MB at hidden 2304, 339 MB at down_proj's 9216). --max-hessian-mem 6 (GiB) bounds it and
+#    splits the capture into hess.1of2.safetensors, hess.2of2.safetensors, ..., printing the
+#    `--hessians a --hessians b` line to paste. A split Hessian is bit-identical to a single-pass one.
 
 # 2) quantization
 cdclq quantize --weights model.safetensors --hessians hess.safetensors --out-dir out \
@@ -324,8 +328,10 @@ uploaded as the `test-log` artifact.
   `out/dequant` (fake-quant weights).
 - CPU only. Measured on a real model: **3–4× GPTQ** at defaults (234–260 s vs 55–109 s for 969 M
   weights, 24 cores). Peak memory per layer ≈ 24·d_in² bytes (d_in = 4096 → ~0.4 GB; 11008 → ~2.9 GB).
-- Hessians are large: `hess-128x2048.safetensors` = 3.7 GB for a 1.1 B model (and ~3.9 GB of fp32 VRAM
-  during capture). On big models capture them in several passes with `--only`.
+- Hessians are large: `hess-128x2048.safetensors` = 3.7 GB for a 1.1 B model (and ~3.9 GB of fp32
+  accumulators during capture). `capture_hessians.py --max-hessian-mem 6` bounds that footprint, splits
+  the capture into as many forward passes as fit the budget and writes one file per pass; `--hessians`
+  then takes several files. `--only` still works for a manual split.
 - Module A (`lllayer`) is untouched by this project.
 
 ## Layout
