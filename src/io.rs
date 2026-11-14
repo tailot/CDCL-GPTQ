@@ -106,14 +106,33 @@ pub fn write_tensors(path: &Path, tensors: &[OutTensor], metadata: Option<HashMa
     Ok(())
 }
 
-/// Calibration Hessians: `<layer>.H` (f32 `n x n`), optional `<layer>.M` (cross-covariance),
+/// Calibration Hessians: `<layer>.H` (f32 `d_in x d_in`), optional `<layer>.M` (cross-covariance),
 /// plus an `aliases` metadata entry (JSON `{layer: owner_layer}`) for layers that share inputs.
+///
+/// The capture script also writes `format`, `generator` and `calib_tokens` — the token count `n`, which bounds
+/// `rank(H) <= n` and is otherwise recoverable only from the file name. The loader reads `aliases` and ignores every
+/// other key, so the header can grow without breaking older binaries.
+///
+/// Index of the first non-finite element, if any. Scanned at load time rather than left to the factorization: a NaN or
+/// Inf in a captured statistic reaches Cholesky as a non-positive pivot, and the hint there ("increase --damp or check
+/// the Hessian") points at a knob that cannot repair a corrupt capture. The cost is one linear pass over the matrix,
+/// negligible next to the Cholesky the same layer pays anyway.
+fn first_non_finite(v: &[f32]) -> Option<usize> {
+    v.iter().position(|&x| !x.is_finite())
+}
+
+/// Calibration Hessians: `<layer>.H` (f32 `d_in x d_in`), optional `<layer>.M` (cross-covariance),
+/// plus an `aliases` metadata entry (JSON `{layer: owner_layer}`) for layers that share inputs.
+///
+/// The capture script also writes `format`, `generator` and `calib_tokens` — the token count `n`, which bounds
+/// `rank(H) <= n` and is otherwise recoverable only from the file name. The loader reads `aliases` and ignores every
+/// other key, so the header can grow without breaking older binaries.
 ///
 /// The store keeps the files mapped and only indexes names at open time, so a Hessian file can be gigabytes without
 /// costing RAM up front; matrices are decoded on demand, one layer at a time, by [`HessianStore::get_h`]. Aliases are
 /// what makes that cheap for grouped-query attention: `q_proj`, `k_proj` and `v_proj` all consume the same hidden
-/// state, so only one of them stores an `n x n` matrix and the other two resolve to it. Without this, a 70B model's
-/// Hessian file would be several times larger than the checkpoint itself.
+/// state, so only one of them stores a `d_in x d_in` matrix and the other two resolve to it. Without this, a 70B
+/// model's Hessian file would be several times larger than the checkpoint itself.
 pub struct HessianStore {
     maps: Vec<Mmap>,
     /// layer name -> index into `maps` (only layers that *own* an `.H`).
@@ -170,7 +189,9 @@ impl HessianStore {
 
     /// Fetch one square matrix for `owner`. A missing optional tensor (`M`) is `Ok(None)`; a present-but-wrong-shaped
     /// one is a hard error, because a non-square Hessian means the capture script and the checkpoint disagree about
-    /// the model and every downstream number would be meaningless.
+    /// the model and every downstream number would be meaningless. Non-finite entries are also a hard error here, named
+    /// by tensor and position: they mean a corrupt capture or a diverged forward, and letting them through only moves
+    /// the failure into Cholesky with a misleading hint.
     fn tensor(&self, owner: &str, suffix: &str) -> Result<Option<(Vec<f32>, usize)>> {
         let Some(&fi) = self.index.get(owner) else { bail!("no Hessian for {owner}") };
         let st = SafeTensors::deserialize(&self.maps[fi]).map_err(|e| anyhow!("{e:?}"))?;
@@ -180,7 +201,16 @@ impl HessianStore {
         if sh.len() != 2 || sh[0] != sh[1] {
             bail!("{key}: expected a square matrix, got {sh:?}");
         }
-        Ok(Some((tensor_to_f32(&t)?, sh[0])))
+        let data = tensor_to_f32(&t)?;
+        if let Some(i) = first_non_finite(&data) {
+            let (d, r, c) = (sh[0], i / sh[0], i % sh[0]);
+            bail!(
+                "{key}: {d} x {d} matrix has a non-finite entry ({}) at [ {r}, {c} ]; \
+                 the calibration data or the captured forward is corrupt, refusing to quantize",
+                data[i]
+            );
+        }
+        Ok(Some((data, sh[0])))
     }
 
     /// The Hessian `X X^T` of the layer's input activations, plus its dimension (the caller checks it against the
@@ -256,4 +286,21 @@ pub fn read_packed_layer(st: &SafeTensors, layer: &str) -> Result<QLayer> {
     let scales: Vec<f32> = sc.data().chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
     let zeros: Vec<f32> = qz.data().iter().map(|&z| z as f32).collect();
     Ok(QLayer::from_packed(d_out, d_in, group, perm, gb.data().to_vec(), qw.data(), scales, zeros))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_non_finite;
+
+    #[test]
+    fn finite_matrices_pass_the_load_scan() {
+        assert_eq!(first_non_finite(&[]), None);
+        assert_eq!(first_non_finite(&[0.0, -0.0, 1.0, f32::MIN, f32::MAX]), None);
+    }
+
+    #[test]
+    fn load_scan_reports_the_first_bad_element() {
+        assert_eq!(first_non_finite(&[1.0, f32::NAN, f32::INFINITY]), Some(1));
+        assert_eq!(first_non_finite(&[1.0, 2.0, f32::NEG_INFINITY]), Some(2));
+    }
 }

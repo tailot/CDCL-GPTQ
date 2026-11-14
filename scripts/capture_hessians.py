@@ -4,7 +4,10 @@
 For every nn.Linear it accumulates  H = (1/N) * sum_t  w_t * x_t x_t^T  over the calibration tokens
 (x_t = the layer input at token t, w_t = optional per-token weight) and writes them to a
 safetensors file as `<module name>.H` (float32).  Linear layers that receive the very same input
-tensor (q/k/v, gate/up) are stored once and recorded in the `aliases` metadata entry.
+tensor (q/k/v, gate/up) are stored once and recorded in the `aliases` metadata entry.  The header
+also carries `format: hessian_v1`, `generator: cdclq-capture` and `calib_tokens` = N: the token
+count bounds rank(H) <= N, and with it in the header that bound is readable from the file instead of
+only from its name.  `cdclq` uses `aliases` and ignores the other keys.
 
     python scripts/capture_hessians.py --model <hf dir or id> --text calib.txt --out hess.safetensors
 
@@ -247,10 +250,23 @@ def main():
             h.remove()
 
         aliases_here = {dep: own for dep, own in probe.items() if own in owners}
+        # What a reader cannot infer from a `d_in x d_in` tensor: that it is a Hessian (`format`), and how many tokens
+        # went into it. N matters because rank(H) <= N, so a capture that was cut short is visible in the header.
+        seen = {c for c in count.values()}
+        meta = {
+            "format": "hessian_v1",
+            "generator": "cdclq-capture",
+            "calib_tokens": str(max(seen)),
+            "aliases": json.dumps(aliases_here),
+        }
+        if len(seen) > 1:
+            # Some layer input saw a different number of tokens (masked or branched forward): the rank bound is then
+            # per layer, so record the range instead of implying one number covers every matrix in the file.
+            meta["calib_tokens_min"] = str(min(seen))
         tensors = {f"{n}.H": (hess[n] / count[n]).cpu().contiguous() for n in hess}
         path = out_path_for(args.out, bi, len(bins))
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        save_file(tensors, path, metadata={"aliases": json.dumps(aliases_here)})
+        save_file(tensors, path, metadata=meta)
         written.append(path)
         n = len(tensors)
         print(

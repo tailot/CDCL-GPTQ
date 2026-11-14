@@ -88,6 +88,9 @@ python scripts/capture_hessians.py --model ./model --text calib.txt --out hess.s
 #    (21 MB at hidden 2304, 339 MB at down_proj's 9216). --max-hessian-mem 6 (GiB) bounds it and
 #    splits the capture into hess.1of2.safetensors, hess.2of2.safetensors, ..., printing the
 #    `--hessians a --hessians b` line to paste. A split Hessian is bit-identical to a single-pass one.
+#    The header records `format=hessian_v1`, the generator and `calib_tokens` (N, which bounds
+#    rank(H) <= N: keep N well above the widest d_in, or the layer is quantized against statistics
+#    that leave most input directions unconstrained).
 
 # 2) quantization
 cdclq quantize --weights model.safetensors --hessians hess.safetensors --out-dir out \

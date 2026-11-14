@@ -1,6 +1,6 @@
 [package]
 name = "cdclq"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "CDCL-GPTQ: conflict-driven, Hessian-exact post-training weight quantizer"
 license = "MIT"
